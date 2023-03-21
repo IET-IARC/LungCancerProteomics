@@ -1,0 +1,2014 @@
+---
+title: "Script: Blood Proteome of Imminent Lung Cancer Diagnosis"
+output: html_notebook
+---
+
+
+
+# Setup 
+```{r}
+rm(list=ls())
+
+library(dplyr)
+library(survival)
+library(ggsci)
+library(ggrepel)
+library(splitstackshape)
+library(metafor)
+library(AROC)
+library(stringr)
+
+#to get data : load first part of phase1cohorts_discovery 
+path_save <- "/data/LC3/work/HanaZahed/Protein Atlas Paper/Protein replication/" 
+path_general <- "/data/LC3/work/HanaZahed/Protein Atlas Paper/" 
+#path_save_clean <- "/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/"
+path_save_clean <- "/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/with imputation/"
+path_data_souce <- "/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/data sources figures/"
+
+set.seed(60)
+
+setwd("/data/LC3/work/HanaZahed/Protein Atlas Paper/")
+# Load script functions
+source("/data/LC3/work/HanaZahed/Protein Atlas Paper/functions_proteinAtlas.R")
+```
+
+
+# Load the data 
+```{r}
+load("/data/LC3/work/HanaZahed/Protein Atlas Paper/Data/data_phase1_harmonized_dry_wet2.RData")
+head(full_data_scaled)
+full_data_scaled <- full_data_scaled %>% mutate(case_status_u19=as.numeric(case_status_u19))
+table(full_data_scaled$case_status_u19)
+
+best_oids <- read.csv("/data/LC3/work/HanaZahed/Protein Atlas Paper/Data/best_oids_selected2.csv")
+head(best_oids)
+best_oids$cohort_id %>% table()
+
+# overall data checks 
+# fill stage for cases and controls
+with(full_data_scaled, table(tnm_all, case_status_u19)) #78 256
+full_data_scaled <- full_data_scaled %>%group_by(caseset) %>% tidyr::fill(tnm_all, .direction="updown") %>% ungroup()
+
+full_data_scaled$history_cancer
+with(full_data_scaled %>% mutate(any_medical=ifelse(is.na(copd)|is.na(family_history_binary)|is.na(history_cancer),1,0)), table(any_medical))
+
+#1232 /nrow(full_data_scaled)
+
+# load imputed data (smoking intensity , years smoked, years since cessation)
+load("/data/LC3/work/Fengx/lungmodel/data/imp/Cohort_imputed_all_final_1.Rdata") 
+Cohort_imputed_all_final_1 %>% names()
+Cohort_imputed_all_final_1$intensity %>% summary
+by(Cohort_imputed_all_final_1$intensity, Cohort_imputed_all_final_1$smoke_status, summary)
+by(Cohort_imputed_all_final_1$years_smoked, Cohort_imputed_all_final_1$smoke_status, summary)
+by(Cohort_imputed_all_final_1$quit_years, Cohort_imputed_all_final_1$smoke_status, summary)
+
+Cohort_imputed_all_final_1 %>% filter(!is.na(caseset), !is.na(Sample_Olink_ID)) %>% dim() #1412
+Cohort_imputed_all_final_1$education %>% table(useNA = "always")
+full_data_scaled$education %>%  table(useNA = "always")
+
+Cohort_imputed_merge <- Cohort_imputed_all_final_1 %>% dplyr::rename(intensity_imp=intensity, years_smoked_imp=years_smoked, quit_years_imp=quit_years, age_imp=age, bmi_imp=bmi,education_imp=education) %>% 
+  filter(case_when(cohort %in% c("HUNT2","HUNT3","MCCS_FUP","MCCS_BL")~!is.na(caseset) & !is.na(Sample_Olink_ID),
+                   T~ is.na(caseset)|!is.na(caseset)))
+
+Cohort_imputed_merge <- Cohort_imputed_merge %>% mutate(U19_id_merge=U19_id,
+                                                        U19_id_merge=str_replace_all(U19_id_merge,"HUNT2|HUNT3","HUNT"),
+                                                        U19_id_merge=str_replace_all(U19_id_merge,"MCCS_FUP|MCCS_BL","MCCS"),
+                                                        U19_id_merge=str_replace_all(U19_id_merge,"CPSII","CPS"))
+
+Cohort_imputed_merge %>% filter(cohort %in% c("CPSII","HUNT2","HUNT3")) %>% pull(U19_id_merge)      
+full_data_scaled <- full_data_scaled %>% mutate(U19_id_merge=paste0(cohort_id, "_", participant_id)) 
+
+#checks ids before merging 
+with(full_data_scaled %>% filter(!U19_id_merge %in% Cohort_imputed_merge$U19_id_merge), table(cohort_id)) # all present
+with(full_data_scaled %>% filter(U19_id_merge %in% Cohort_imputed_merge$U19_id_merge), table(cohort_id)) # all present
+with(Cohort_imputed_merge %>% filter(U19_id_merge %in% full_data_scaled$U19_id_merge), table(cohort)) # OK
+
+full_data_scaled %>%dim()#1462 1259
+# Merge 
+full_data_scaled <- full_data_scaled %>% merge(dplyr::select(Cohort_imputed_merge,U19_id_merge,intensity_imp, years_smoked_imp, quit_years_imp, age_imp, bmi_imp, education_imp), all.x = TRUE, all.y = FALSE) 
+
+full_data_scaled %>%dim()#1462 1263
+# check with ages [i will keep age imp just for checks that i merge the right ones from the followup ]
+summary(full_data_scaled$age-full_data_scaled$age_imp) ##?
+with(full_data_scaled %>% filter(age!=age_imp), table(cohort_id)) # EPIC?? /// yes because age blood draw and age recruitement in EPIC is not the same => OK
+
+summary(full_data_scaled$intensity_imp) # no missing 
+summary(full_data_scaled$intensity) 
+
+summary(full_data_scaled$years_smoked_imp) # no missing 
+summary(full_data_scaled$years_smoked) # no missing 
+
+summary(full_data_scaled$quit_years_imp) # no missing
+summary(full_data_scaled$quit_years) # no missing
+
+# cross table education 
+with(full_data_scaled, table(education, education_imp, useNA = "always"))
+```
+    
+# Protein sets and lists 
+```{r}
+
+all_proteins_list <- unique(best_oids$Assay)
+
+## create a set of proteins that are exclusivly measured in EPIC and NSHDS
+protNSHDS_EPIC <- full_data_scaled%>%filter(!cohort_id %in% c("EPIC","NSHDS"))%>%select_if(all_na)%>%names%>%.[. %in% best_oids$Assay] #get only protein names #678 proteins 
+length(protNSHDS_EPIC)#678 
+protein_names_full <- read.csv("/data/LC3/files/01-Databases/Targeted discovery master data/Annotations_Olink.csv")
+protein_names_full %>% filter(EPIC==1, NSHDS==1, is.na(CPSII), is.na(SCHS), is.na(HUNT), is.na(MCCS)) %>% arrange(Assay) %>% add_count(Assay) %>% filter(n>1) #693 / duplicates and not selected in best oids
+
+## create a set of proteins that are measured in the rest of the cohorts 
+prot_allcohorts <- all_proteins_list%>%.[!. %in% c(protNSHDS_EPIC,"MAPT") ] #484 protein #check what is happening with MAPT
+
+
+#####
+all_proteins_list2 <- all_proteins_list[all_proteins_list!="MAPT"]
+
+full_data_scaled %>%filter(cohort_id %in% c("EPIC", "NSHDS")) %>%  group_by(cohort_id) %>% summarise(n=n(), across(prot_allcohorts, ~n-sum(is.na(.)))) %>% dplyr::select(where(~min(.)==0))
+#ADGRB3, IL2, LTBP3
+```
+
+# Baseline data description
+## Summary
+U19 publication on all biomarkers measured, and their univariate association to lung cancer. It will summarize the association, and emphasize on the results that were replicated. It will include network analysis and risk analysis 
+
+This script follow the phase1cohorts_discovery script, and aims to make additional analysis and tables for the expected publication
+
+## Table 1 & Sup Data 1:
+age, sex, bmi, smoke, histology, time to diagnosis[devide 0-1,1-2,2-3] , by case and controls, p diff {t for cont, chisq for cat) (re do it stratified by cohort same in supp) , 2 [continuous variables present mean and sd unless its massively skewed]
+
+```{r}
+library(flextable)
+library(gtsummary)
+
+full_data_scaled %>% dplyr::select(case_status_u19, age,sex,bmi, followup_lc, followup_mortality,smoke_status,intensity,years_smoked, quit_years,Histology_u19, tnm_all,cohort_id) %>% mutate(quit_years=ifelse(smoke_status==3,NA, as.numeric(quit_years))) %>% gtsummary::tbl_summary(by=case_status_u19,type=c("age","bmi", "followup_lc", "followup_mortality","intensity","years_smoked", "quit_years")~"continuous",statistic = list(all_continuous() ~ "{mean} ({sd})",
+                     all_categorical() ~ "{n} ({p}%)"),digits = all_continuous() ~ 1) %>% add_n() %>% as_flex_table() %>%
+  flextable::save_as_docx(path=paste0(path_save_clean,"tables/table1_demo.docx"))
+
+
+### sup table strat by cohort
+
+strat_dem_table_sup <- full_data_scaled %>%mutate(quit_years=ifelse(smoke_status==3,NA, as.numeric(quit_years)))%>% dplyr::select(case_status_u19, age,sex,bmi, followup_lc, followup_mortality,smoke_status,intensity,years_smoked, quit_years,Histology_u19, tnm_all, cohort_id) %>% gtsummary::tbl_strata(cohort_id, .tbl_fun=~.x %>% tbl_summary(by=case_status_u19,type=c("age","bmi", "followup_lc", "followup_mortality","intensity","years_smoked", "quit_years")~"continuous",statistic = list(all_continuous() ~ "{mean} ({sd})",
+                     all_categorical() ~ "{n} ({p}%)"),digits = all_continuous() ~ 1) %>% add_n())
+by(full_data_scaled$intensity, full_data_scaled$cohort_id, summary)
+
+by(full_data_scaled$intensity, full_data_scaled$cohort_id, class)
+
+with(full_data_scaled %>% filter(cohort_id=="NSHDS"), table(intensity, useNA = "always")) #cat 
+
+strat_dem_table_sup%>% as_flex_table()%>%flextable::save_as_docx(path=paste0(path_save_clean,"tables/table1_supdemo_stratCohorts.docx"))
+
+## save as document to excel
+strat_dem_table_sup_excel <- strat_dem_table_sup %>% as_tibble()
+
+
+full_data_scaled %>% group_by(cohort_id, case_status_u19) %>% summarise(intensity_m=mean(intensity, na.rm=TRUE), intensity_sd=sd(intensity, na.rm = TRUE))
+```
+
+# #################################### 
+# Analysis part 
+
+# Univariate results
+using data with selected oids by cohort ( 3rd method in phase 1 cohort discovery -> run code until datasetup)
+
+Protein's univariate association to lung cancer in cohorts-discovery and replication analysis 
+
+All proteins are not measured in all the cohorts , there are 500 only measured in NSHDS and EPIC
+so to overcome power issue 
+Design :
+two stage design : use the scaled data 
+1. like one set is EPIC/NSHDS for proteins not measured in the other four cohorts ( ~500 proteins) 
+we split that 70/30 balanced by cohort and sex  
+2.then we do what what we already did for the other 6 cohorts 
+
+=> we could do two volcano plots, or put them on the same plot with different ENT thresholds to differentiate
+(for 500 proteins run ENT only on 500 proteins)
+
+1) Replication without CV
+divide train/test 75-25
+stratified splits package : splitstacksape (function : stratify)=> make sure only by case?
+
+2) Replication with CV (beta and IC)
+
+## select sets of proteins 
+
+Create dataset to save with only EPIC/NSHDS participants and proteins measured in EPIC/NSHDS and another with all the participants and only the proteins that were measured in all cohorts
+
+```{r}
+EPIC_NSHDS <- full_data_scaled%>%filter(cohort_id %in% c("EPIC","NSHDS"))%>%dplyr::select(-all_of(prot_allcohorts))
+dim(EPIC_NSHDS) #504 774
+
+#write.csv(EPIC_NSHDS, "C:/Users/zahedh/Dropbox/Lung_Proteomics/Hana/Protein Atlas Paper/Protein data/EPIC_NSHDS.csv",row.names = FALSE)
+
+all_cohorts_prot <- full_data_scaled%>%dplyr::select(-all_of(protNSHDS_EPIC))
+dim(all_cohorts_prot) #1459 565
+#write.csv(all_cohorts_prot, "C:/Users/zahedh/Dropbox/Lung_Proteomics/Hana/Protein Atlas Paper/Protein data/all_cohorts_prot.csv", row.names=FALSE)
+```
+
+
+## Get ENT significance 
+effective number of tests (ENT) = a Bonferroni correction for the number of principal components needed to explain 95% of the variance in proteins 
+
+```{r}
+# ENT for proteins measured on all cohorts 
+library(FactoMineR)
+library(tibble)
+m1 <- data.matrix(na.omit(full_data_scaled[,c(prot_allcohorts)]), rownames.force = NA)
+respca <- PCA(m1, ncp=200)
+eigpca <- respca$eig%>%as.data.frame()
+head(eigpca)
+eigpca%>%filter(`cumulative percentage of variance`>94 & `cumulative percentage of variance`<95)%>%tibble::rownames_to_column()%>%slice_max(`cumulative percentage of variance`)#%>%select(rowname) #192
+
+# we decided to stick with all cohorts training method 
+# all_cohorts_ENT <- all_cohorts_prot%>%arrange(protein)%>%mutate(sig=case_when(pvalue<0.05/192 & set=="training"~1,pvalue<0.05 & set=="testing"~1, TRUE~0))%>%group_by(protein)%>%add_count(sig)%>%mutate(signifance_rep=case_when(sig==1 &n==2 ~ "significant in both set", sig==1 & n==1 & set=="training" ~"signifacant but not replicated", TRUE~ "not signicant"))
+# 
+# all_cohorts_ENT%>%dplyr::select(-c("sig","n"))#%>%write.csv(paste0(path_save,"proteins_allcohort_train_ENT.csv"), row.names=FALSE) #28 selected protein
+
+# ############
+#  ENT for EPIC and NSHDS exclusive proteins 
+m2 <- data.matrix(na.omit(EPIC_NSHDS[,c(protNSHDS_EPIC)]), rownames.force = NA)
+respca <- PCA(m2, ncp=200)
+eigpca <- respca$eig%>%as.data.frame()
+head(eigpca)
+eigpca%>%filter(`cumulative percentage of variance`>94 & `cumulative percentage of variance`<95)%>%rownames_to_column()%>%slice_max(`cumulative percentage of variance`)#%>%select(rowname) #241
+
+# ###################
+# ENT for SCHS
+protSCHS <- full_data_scaled%>%filter(cohort_id =="SCHS")%>%select_if(all_not_na)%>%names%>%.[. %in% best_oids$Assay]
+SCHS_data <- full_data_scaled%>%filter(cohort_id =="SCHS")
+m3 <- data.matrix(na.omit(SCHS_data[,c(protSCHS)]), rownames.force = NA)
+respca <- PCA(m3, ncp=200)
+eigpca <- respca$eig%>%as.data.frame()
+head(eigpca)
+eigpca%>%filter(`cumulative percentage of variance`>94 & `cumulative percentage of variance`<95)%>%tibble::rownames_to_column()%>%slice_max(`cumulative percentage of variance`)#106
+```
+
+# ################################################################
+# Resampling Algorithm 
+to make sure that by using different samples we don't get a lot of different results 
+
+for everybootstrapped data :
+1) training and testing set 
+2) note the proteins that were selected : in a table with proteins in first column rows, and each new column is the result of bootstrapped data : 1= replicated in both sets, 0=not replicated
+
+=> get proteins that were replicated 95% of the time
+
+we will try using 500 bootstraps 
+actually the proper word is not bootstrap because we will not sample with replacement, we will proceed the same way to get training and testing set, but we will change seed before running each set
+we will run two analysis seperately for EPIC/NSHDS and the rest 
+
+
+Run as local job
+#36 identified proteins 
+```{r}
+library(dplyr)
+library(survival)
+library(splitstackshape)
+bootstrap_allcohortstrained_selectprot <- sample_testing_replication(full_data_scaled, prot_allcohorts, 500, 192)
+
+bootselection <- bootstrap_allcohortstrained_selectprot%>%mutate(times=rowSums(.[as.character(c(1:500))]))%>%dplyr::select(protein, times)%>%filter(times!=0)%>%mutate(prop=times/5)
+
+## for EPIC/MNSHDS
+library(dplyr)
+library(survival)
+library(splitstackshape)
+repeated_prot_EPICNSHDS <- sample_testing_replication_en(filter(full_data_scaled, cohort_id %in% c("EPIC","NSHDS")), protNSHDS_EPIC, 500, 241)
+
+head(repeated_prot_EPICNSHDS)
+repeated_prot_EPICNSHDS %>% filter(times>=250)
+```
+
+# Plot the resampling results 
+## Sup Fig 3 
+```{r}
+table_prop_sel <- bind_rows(EPICNSHDS=repeated_prot_EPICNSHDS, all=bootstrap_allcohortstrained_selectprot, .id="set") %>% filter(times>0) %>% mutate(prop=paste0(formatC(times/5, digits = 1, format="f"), "%")) %>% dplyr::select(set, protein, times, prop) %>% group_by(set) %>% arrange(desc(times), .by_group = TRUE) %>%mutate(set=ifelse(set=="all", "All cohorts", "EPIC and NSHDS")) %>%  dplyr::rename(`Cohort set`=set, Protein=protein, `Number of times \nreplicated`=times, `Proportion of times \nreplicated`=prop)
+
+table_plt_slct <- ggpubr::ggtexttable(table_prop_sel, rows = NULL,theme=ggpubr::ttheme(base_style = "light",base_size = 9,padding = unit(c(0.5, 0.5), "mm")))
+
+plot_selection_resampling_protein <- bind_rows(EPIC_NSHDS=repeated_prot_EPICNSHDS %>%rowwise() %>%mutate(avb = mean(c_across(starts_with("beta_")),na.rm=TRUE)) %>% dplyr::select(protein, times, avb) , all_cohorts=bootstrap_allcohortstrained_selectprot %>%rowwise() %>%mutate(avb = mean(c_across(starts_with("beta_")),na.rm=TRUE)) %>% dplyr::select(protein, times, avb) , .id="cohort") %>% filter(times>0)%>%
+    mutate(avB=avb,prop=times/500*100,opaque=ifelse(prop<50,"0","1"))%>%arrange(prop,avB)%>%mutate(protein=factor(protein,levels=protein))%>%ggplot(aes(x=protein,y=prop,size=avB, color=cohort))+geom_point(aes(alpha=opaque))+scale_size_continuous(range=c(2,3.5))+scale_alpha_discrete(range=c(0.3,1),guide=FALSE)+theme_bw()+labs(x="Protein",y="Proportion (%) of times replicated",title="Proportion of proteins with a significant association to lung cancer \nin 500 resamplings of discovery and replication sets",caption="We considered a protein 'replicated' if it has a pvalue<0.05/ENT in the discovery set and a pvalue<0.05 in the replication set.\nWe calculate the mean effect size using the beta estimates of the training sets in the iterations where the protein was replicated.",color="Measured in",size="Mean effect size")+theme(plot.title = element_text(face="bold", hjust=0.5), axis.title = element_text(face="bold"), axis.text.x = element_text(angle = 45, hjust=1), plot.caption = element_text(hjust=0))+scale_color_nejm(labels=c("All cohorts", "EPIC and NSHDS"))
+
+
+png(paste0(path_save_clean, "figures/Supfigure_resampling_protselection.png"), width=2500, height=1300, res=250)
+plot_selection_resampling_protein
+dev.off()
+```
+
+Get list of repated proteins via resampling 
+```{r}
+#repeated_prot_EPICNSHDS <- read.csv("/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/bootstraps_tables/ReplicatedEPICNSHDS_prot_boot.csv")
+#bootstrap_allcohortstrained_selectprot <- read.csv("/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/bootstraps_tables/Replicated_prot_boot.csv")
+
+# all_replicated_once <- c(repeated_prot_EPICNSHDS %>%filter(times>0) %>% pull(protein), bootstrap_allcohortstrained_selectprot %>%filter(times>0) %>% pull(protein))
+# 
+# replicated_50 <-  c(repeated_prot_EPICNSHDS %>%filter(times>=250) %>% pull(protein), bootstrap_allcohortstrained_selectprot %>%filter(times>=250) %>% pull(protein))
+# #replicated_50[!replicated_50 %in% replicated_50_old]
+# #replicated_50_old[!replicated_50_old %in% replicated_50]
+# length(replicated_50) #36
+
+# dput(replicated_50)
+replicated_50 <- c("CFHR5", "SPINT1", "ALPP", "ANGPT2", "CASP-8", "CDCP1", "CEACAM5",
+"CHI3L1", "CXCL13", "CXCL9", "CXL17", "EN-RAGE", "GDF-15", "HGF",
+"IFI30", "IGFBP-1", "IGFBP-2", "IL2-RA", "IL6", "LAMP3", "MK",
+"MMP12", "MUC-16", "OSM", "S100A11", "SCF", "SFTPA1", "SYND1",
+"TFPI-2", "TGF-alpha", "TNFRSF6B", "TNFSF13B", "U-PAR", "VEGFA",
+"VWA1", "WFDC2")
+```
+
+# #################
+# Overall ORs & AUCs
+## Fig 1& Sup Data 4 
+chunk to get raw OR table
+```{r}
+# renaming intensity_imp, years_smoked_imp and quit_years imp so that i don't need tp change it all the way in the script
+full_data_scaled <- full_data_scaled %>% dplyr::rename(intensity_m=intensity, years_smoked_m=years_smoked, quit_years_m=quit_years, bmi_m=bmi, education_m=education)
+summary(full_data_scaled$intensity_m)
+
+full_data_scaled <- full_data_scaled %>% dplyr::rename(intensity=intensity_imp, years_smoked=years_smoked_imp, quit_years=quit_years_imp, education=education_imp, bmi=bmi_imp)
+summary(full_data_scaled$quit_years)
+summary(full_data_scaled$quit_years_m)
+# OK
+
+library(dplyr)
+library(survival)
+# AUCs plco are calculated for the same sample for each protein 
+effect_size_proteins <- aucs_model_prot(full_data_scaled,all_proteins_list, "overall_effectsize_AUC_imputed")
+
+```
+comparisons of different levels of significance
+```{r}
+#classify by sets where measured , and by ENT significance overall 
+effect_size_proteins <- effect_size_proteins%>%mutate(measured_in=case_when(protein %in% protNSHDS_EPIC ~ "EPIC_NSHDS", TRUE~"all cohorts"),ENT_sig=case_when(measured_in=="all cohorts"&pvalue<0.05/192|measured_in!="all cohorts" &pvalue<0.05/241~"ENT sig", T~"Not_ENT"))
+
+#get ENT significance overall 
+
+##adding CI for ORs 
+effect_size_proteins <- effect_size_proteins %>% mutate(lowerCI=exp(log(OR)-1.96*sd),upperCI=exp(log(OR)+1.96*sd))
+
+## distinction by robustness off asso : selected+ENT, only ENT, rest
+effect_size_proteins <- effect_size_proteins %>% mutate(robustness=case_when(protein %in% replicated_50 & ENT_sig=="ENT sig"~"Robust and ENT significant",  !protein %in% replicated_50 & ENT_sig=="ENT sig"~"Non-robust ENT significant", protein %in% replicated_50& ENT_sig!="ENT sig"~"replicated,not ENT",T~"Below ENT-significance" ))
+
+effect_size_proteins %>% filter(protein %in% replicated_50) %>% dplyr::select(delta_auc_prot) %>% summary
+effect_size_proteins %>% filter(!protein %in% replicated_50) %>% dplyr::select(delta_auc_prot) %>% summary
+
+## comparisons of AUCs distributions 
+effect_size_proteins %>% filter(robustness=="Robust and ENT significant") %>% pull(delta_auc_prot) %>% summary()
+
+effect_size_proteins %>% filter(robustness!="Robust and ENT significant") %>% pull(delta_auc_prot) %>% summary()
+
+############## Bonf vs ENT 
+effect_size_proteins <- effect_size_proteins %>% 
+  mutate(bonf_thresh=case_when(measured_in=="all cohorts"~0.05/484,
+                               measured_in=="EPIC_NSHDS"~0.05/678),
+         bonf_sig=ifelse(pvalue<bonf_thresh,1,0))
+
+
+with(effect_size_proteins, table(ENT_sig, bonf_sig, useNA = "always")) #only 10 over 67 proteins were not bonf sif but were ent sig 
+effect_size_proteins %>% filter(ENT_sig=="ENT sig", bonf_sig=="0") 
+
+effect_size_proteins$bonf_sig %>% table()
+```
+
+Adding uniprot IDs and links to the effect size table for supplements 
+## Sup data 4
+```{r}
+## clean and format numbers
+effect_size_table <- effect_size_proteins%>% mutate(across(c("OR","lowerCI","upperCI","z_stat"), ~sprintf('%.2f',.))) %>% mutate(CI=paste0(lowerCI,", ",upperCI), pvalue=formatC(pvalue, format = "e", digits = 2), OR=as.numeric(OR), across(contains("auc"), ~formatC(.,digits=4, format="f"))) %>%
+  mutate(bonf_sig=case_when(bonf_sig==0~"Not Bonferroni significant",
+                            bonf_sig==1~"Bonferroni significant"))
+
+
+#Identified as being associated with lung cancer risk,P-value below ENT-threshold,	P-value below Bonferroni-threshold
+effect_size_table <- effect_size_table %>% dplyr::select(c("protein", "tot_obs","OR","CI", "z_stat", "pvalue", "robustness", contains("auc"), "bonf_sig"))%>% 
+  mutate(bonf_sig=case_when(bonf_sig=="Not Bonferroni significant"~"No",
+                            bonf_sig=="Bonferroni significant"~"Yes",
+                            T~bonf_sig),
+         ENT_sig=case_when(robustness=="Below ENT-significance"~"No",
+                           robustness %in% c("Non-robust ENT significant","Robust and ENT significant")~"Yes",
+                           T~robustness),
+         identified_markers_LC=case_when(robustness %in% c("Non-robust ENT significant","Below ENT-significance")~"No",
+                                         robustness == "Robust and ENT significant"~"Yes",
+                                         T~robustness))
+
+# adding uniprot IDs to the table 
+full_oids <- read.csv("/data/LC3/files/01-Databases/Targeted discovery master data/Annotations_Olink.csv")
+
+#keep one protein name (oids are different , but uniprot ids are the same => what we want )
+full_oids %>% distinct(Assay,.keep_all = TRUE) %>% dim() #1163   26 [mapt]
+full_oids <- full_oids%>% distinct(Assay,.keep_all = TRUE)
+
+dim(effect_size_table) #1162    12
+dim(full_oids)  #1163   26
+
+effect_size_table <- effect_size_table %>% merge(dplyr::select(full_oids, Assay, Uniprot.ID), by.x="protein", by.y="Assay", all.x=TRUE, all.y=FALSE)
+dim(effect_size_table) #1162   13
+head(effect_size_table)
+effect_size_table %>% filter(is.na(Uniprot.ID)) #ok
+
+## adding links 
+effect_size_table <- effect_size_table%>%mutate(link=ifelse(!is.na(Uniprot.ID),paste0("https://www.uniprot.org/uniprot/",Uniprot.ID),NA))
+
+
+effect_size_table <- effect_size_table%>%mutate(across(everything(), ~ifelse(is.na(.), " ",.)))
+library(openxlsx)
+
+#create sample data
+
+# add new column that manually constructs Excel hyperlink formula
+# note backslash is required for quotes to appear in Excel
+effect_size_table <- effect_size_table %>%
+  mutate(excel_link = ifelse(!is.na(Uniprot.ID),paste0(
+      "HYPERLINK(\"",
+      link,
+      "\", \"",
+      Uniprot.ID,
+      "\")"),NA))
+
+# specify column as formula per openxlsx::writeFormula option #2
+class(effect_size_table$excel_link) <- "formula"
+
+
+
+
+## save data ##
+library(openxlsx)
+
+# # create and write workbook
+wb <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb, "protein_OR")
+
+#all proteins 
+openxlsx::writeData(wb, "protein_OR", effect_size_table)
+openxlsx::saveWorkbook(wb,paste0(path_save_clean ,"tables/suptable4_allprot_OR.xlsx"), overwrite = TRUE)
+
+
+#replicated 50
+wb2 <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb2, "protein_OR")
+effect_size_table_50 <- effect_size_table %>% filter(protein %in% replicated_50)
+class(effect_size_table_50$excel_link) <- "formula"
+openxlsx::writeData(wb2, "protein_OR", effect_size_table_50)
+openxlsx::saveWorkbook(wb2,paste0(path_save_clean ,"tables/replicatedprot_OR.xlsx"), overwrite = TRUE)
+
+#####
+effect_size_table %>% dplyr::filter(protein %in% replicated_50) %>% arrange(delta_auc_prot) %>% dplyr::select(protein, delta_auc_prot)
+```
+
+## Figure 1
+Overall results volcano plot
+```{r}
+library(ggtext)
+plot_OR <- effect_size_proteins%>%mutate(opaque=case_when(robustness=="Below ENT-significance"~0.5,robustness=="p<0.05/ENT in overall sample"~0.75,T~1), robustness=factor(robustness,levels=c("Robust and ENT significant","Non-robust ENT significant","Below ENT-significance"), labels =c("Identified risk markers","*p* <0.05/ENT in overall sample","*p* ≥0.05/ENT in overall sample")))%>%
+  ggplot(aes(x=OR,y=-log10(pvalue),color=robustness))+
+  geom_point(aes(alpha=opaque))+scale_alpha(guide="none")+
+  geom_hline(yintercept = -log10(0.05/192),linetype="dashed", color="grey")+
+  ggrepel::geom_label_repel(data=.%>% filter(robustness =="Identified risk markers"),aes(label=protein),size = 3.5,  max.overlaps = getOption("ggrepel.max.overlaps", default = 450), show.legend = FALSE)+
+  labs(x="Odds Ratio",y="-Log10 (p-value)", color="Legend")+theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5, face="bold", size=10),
+        legend.position = c(0.2, 0.8),
+        legend.title = element_text(face="bold", size=13),
+        axis.title = element_text(face="bold", size=13), 
+        axis.text = element_text(size=10),legend.text = element_markdown(size=10))+
+  scale_color_manual(values =  c( "Identified risk markers" = "#0072b5ff", "*p* <0.05/ENT in overall sample" = "#E18727FF","*p* ≥0.05/ENT in overall sample" = "#BC3C29FF"))
+
+png(paste0(path_save_clean,"figures/volcanoplot_OR_figure1.png"), height=1400,width = 2100, res=300)
+plot_OR
+dev.off()
+
+pdf(paste0(path_save_clean,"figures/volcanoplot_OR_figure1.pdf"), width = 9, height = 6)
+plot_OR
+dev.off()
+
+grDevices::cairo_pdf(paste0(path_save_clean,"figures/volcanoplot_OR_figure1.pdf"),width = 8, height = 6 )
+plot_OR
+dev.off()
+```
+
+# Sensitivity analysis 
+
+## A- Methods comparisons
+Compare protein outcomes with the selected method vs traditional discovery/rep methods 
+Make sure common proteins have the same association to LC incidence in disovery (EPIC/ NSHDS) and replication 
++ add AUCs so we can compare
+
+compare the results of our resamplings compared to a traditional discovery/replication analysis 
+where fdr<0.05 in discovery and p<0.05 in replication without resamplings 
+### Sup Figure 4 & Sup Data 6
+```{r}
+## Volcano plot on common proteins
+#rescale within each set 
+
+#aucs_model_prot
+
+HR_discovery <- aucs_model_prot(filter(full_data_scaled, cohort_id %in% c("EPIC","NSHDS")) , prot_allcohorts[!prot_allcohorts %in% c("ADGRB3","IL2","LTBP3")], "discovery_OR") %>% mutate(pfdr=p.adjust(pvalue, method="fdr")) #ADGRB3 missing from both EPIC and NSHDS
+HR_replication <-aucs_model_prot(filter(full_data_scaled, !cohort_id %in% c("EPIC","NSHDS")), prot_allcohorts, "replication_OR") %>% mutate(pfdr=p.adjust(pvalue, method="fdr"))
+
+
+HR_combined_disc_rep <- bind_rows(Discovery=HR_discovery, Replication=HR_replication, .id="phase")
+any_fdr_rep_disc <- HR_combined_disc_rep %>% filter(pfdr<=0.05) %>% pull(protein) %>% unique()
+
+## get list of fdr_replicated proteins : discovery (fdr) replication (nom)
+fdr_discovery <- HR_discovery %>% filter(pfdr<=0.05) %>% pull(protein)
+nominal_rep <- HR_replication %>% filter(pvalue<=0.05) %>% pull(protein)
+labeled_replicated <- nominal_rep %>% .[. %in% fdr_discovery]
+
+#checks 
+nominal_rep %>% .[. %in% fdr_discovery] #39?
+fdr_discovery %>% .[. %in% nominal_rep]#39?
+
+
+png("/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/Revisions/replication_discovery_FDR.png", height=1900, width=2800, res=280)
+HR_combined_disc_rep%>%filter(!is.na(OR)) %>%  add_count(protein) %>% filter(n>1) %>%
+  mutate(phase=case_when(phase=="Discovery"~"Discovery\n(EPIC, NSHDS)",
+                         phase=="Replication"~"Replication\n(CPS, MCCS, SCHS, HUNT)"), opaque=ifelse(protein %in% labeled_replicated, 1,0)) %>% ggplot(aes(x=OR, y=-log10(pvalue), color=phase))+geom_point(aes(alpha=opaque))+scale_alpha(guide=FALSE)+ggrepel::geom_label_repel(data=. %>% filter(protein %in% labeled_replicated), aes(label=protein), max.overlaps = 66, show.legend = FALSE)+labs(y="-Log10(p-value)", x="Odds Ratio", color="Study phase")+theme_bw()+theme(axis.title = element_text(face="bold"), legend.title = element_text(face="bold"))+ggsci::scale_color_nejm()
+dev.off()
+
+HR_combined_disc_rep %>% filter(is.na(OR)) #ok the ones not measured in EPIC NSHDS
+HR_combined_disc_rep %>% filter(protein=="ADGRB3")
+
+
+# Create a summmary table and comparisons to robust markers  
+HR_combined_disc_rep %>%filter(protein %in% labeled_replicated) %>%  dplyr::select(protein, phase, OR, pvalue, pfdr) %>% mutate(robust_marker=ifelse(protein %in% replicated_50, "yes", "no"))
+
+#run overall clogits 
+#HR_rep50_fdrselected <- univ_clogits(full_data_scaled,  unique(c(replicated_50,labeled_replicated))) %>% mutate(phase="overall")
+HR_rep50_fdrselected <- effect_size_table %>% filter(protein %in%c(replicated_50,labeled_replicated))%>% mutate(phase="overall", pvalue=as.numeric(pvalue))
+
+class(HR_combined_disc_rep$pvalue)
+
+HR_rep50_fdrselected <- HR_rep50_fdrselected %>% mutate(across(c("auc_plco_protcc_data" , "auc_prot","auc_plco_prot","delta_auc_prot"),~as.numeric(.) ))
+
+summary_protein_selection_fdr_comp <- HR_combined_disc_rep %>%  dplyr::select(protein, phase, OR, pvalue, pfdr, auc_plco_protcc_data , auc_prot,auc_plco_prot, delta_auc_prot) %>% bind_rows(dplyr::select(HR_rep50_fdrselected,protein, phase, OR, pvalue,auc_plco_protcc_data , auc_prot,auc_plco_prot, delta_auc_prot)) %>% mutate(robust_marker=ifelse(protein %in% replicated_50, "yes", "no"), robust_marker_missed=ifelse(protein %in% replicated_50 & !protein %in% labeled_replicated, protein, "")) %>% filter(protein %in%  unique(c(replicated_50,labeled_replicated))) 
+
+
+summary_protein_selection_fdr_comp_excel <- summary_protein_selection_fdr_comp %>% 
+  mutate(OR=formatC(OR, digits=2, format="f"), 
+         across(c("pvalue","pfdr"), ~formatC(., digits = 2, format="e")),
+         across(contains("auc"), ~formatC(., digits=4, format="e"))) %>% 
+  dplyr::rename(Protein=protein, Set=phase, `pvalue (fdr adjusted)`=pfdr,
+                `AUC protein`=auc_prot,
+                `AUC PLCOm2012`=auc_plco_protcc_data, 
+                `AUC PLCOm2012+protein`=auc_plco_prot, `delta chance in AUC`=delta_auc_prot,
+                `Identified using the resampling procedure`=robust_marker) %>% 
+  mutate(`Identified using single split sample method`= ifelse(Protein %in% labeled_replicated, "yes","no"))
+
+write.csv(summary_protein_selection_fdr_comp_excel,paste0(path_save_clean, "suptable6_selectionmethods_comparisons.csv"),row.names = FALSE)
+
+
+#summary_protein_selection_fdr_comp %>%write.csv("/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/Revisions/summary_proteins_replication_discovery_fdr_vs_loop.csv", row.names = FALSE)
+
+## Volcano plot identified selected in resampling vs replication/discovery
+comparison_proteinIdent_method <- HR_rep50_fdrselected %>% dplyr::select(protein, phase, OR, pvalue) %>% 
+  mutate(robust_marker=ifelse(protein %in% replicated_50, "yes", "no"),
+         identified_by=case_when(protein %in% labeled_replicated & !protein %in% replicated_50~"Single split-sample method",
+                                 protein %in% replicated_50 & !protein %in% labeled_replicated ~ "Resampling method", 
+                                 protein %in% replicated_50 & protein %in% labeled_replicated ~ "Both methods")) %>% ggplot(aes(x=OR, -log10(pvalue), color=identified_by))+geom_point()+ggrepel::geom_label_repel(aes(label=protein), show.legend = FALSE, max.overlaps = 150)+labs(y="-Log10(p-value)", x="Odds Ratio", color="Protein identified by:")+theme_bw()+theme(axis.title=element_text(face="bold"), legend.title = element_text(face="bold"))+scale_color_manual(values=c("Resampling method"="#0072B5FF", "Single split-sample method"="#E18727FF","Both methods"="#20854EFF"))
+
+png("/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/Revisions/replication_discovery_FDR_comparisonROBUST.png", height=1700, width=3000, res=320)
+comparison_proteinIdent_method
+dev.off()
+
+
+### data table
+data_table_numbers <- HR_rep50_fdrselected %>% dplyr::select(protein, phase, OR, pvalue) %>% 
+  mutate(robust_marker=ifelse(protein %in% replicated_50, "yes", "no"),
+         identified_by=case_when(protein %in% labeled_replicated & !protein %in% replicated_50~"Discovery/Replication FDR",
+                                 protein %in% replicated_50 & !protein %in% labeled_replicated ~ "Resampling algorithm", 
+                                 protein %in% replicated_50 & protein %in% labeled_replicated ~ "Both methods")) 
+
+table(data_table_numbers$identified_by) #OK
+```
+
+## B- Associations of proteins to risk factors (e.g. smoking)/ confounding?
+
+### Adjusted ORs
+calculate univ associations when models are separately adjusted on known risk factors vs main-analysis 
+### Fig 2, Sup Data 10
+```{r}
+library(stringr)
+library(tidyr)
+variable_toadjust <- c("intensity+years_smoked","intensity+years_smoked+quit_years") ## 
+adjusted_OR <- univ_clogits_adj(full_data_scaled, replicated_50, variable_toadjust)
+adjusted_OR <- adjusted_OR %>% mutate(lowerCI=exp(estimate-1.96*std.error),upperCI=exp(estimate+1.96*std.error))
+
+#protein beta sd pvalue zstat tot_obs OR adjustment 
+comp_adj_OR <- effect_size_proteins %>% filter(protein %in% replicated_50) %>% dplyr::rename(term=protein, estimate=beta, std.error=sd, p.value=pvalue, statistic=z_stat) %>% mutate(adjustment="none",lowerCI=exp(estimate-1.96*std.error),upperCI=exp(estimate+1.96*std.error)) %>% bind_rows(adjusted_OR) %>% mutate(adjustment=factor(adjustment, levels =c("intensity+years_smoked+quit_years","intensity+years_smoked","none"),labels = c("Smoking intensity, years smoked and years since cessation","Smoking intensity and years smoked", "Not adjusted")))
+
+
+adjusted_OR_excel <- comp_adj_OR %>% mutate(across(c("estimate", "std.error", "OR","statistic", "lowerCI", "upperCI"), ~formatC(., digits = 2, format="f")),orci=paste0(lowerCI,"-", upperCI),`OR (95% CI)`=paste0(OR, " (",orci,")"), p.value=formatC(p.value, digits=2, format="e"), adjustment=ifelse(adjustment=="Not adjusted", "Not adjusted (Main analysis)", as.character(adjustment))) %>% 
+  dplyr::select(term,adjustment, `OR (95% CI)`, p.value,estimate, std.error, statistic,tot_obs )%>% 
+  filter(adjustment!="Smoking intensity and years smoked") 
+
+write.csv(adjusted_OR_excel, paste0(path_save_clean, "tables/supT10_ORs_adj.csv"))
+
+
+
+## plot 
+replicated50_sort <- sort(replicated_50)
+
+adj_plt <- comp_adj_OR%>% 
+  mutate(adjustment=ifelse(adjustment=="Not adjusted", "Not adjusted (Main analysis)", as.character(adjustment)), 
+         adjustment=factor(adjustment, 
+                           levels=c("Smoking intensity, years smoked and years since cessation","Smoking intensity and years smoked","Not adjusted (Main analysis)"))) %>% filter(adjustment!="Smoking intensity and years smoked") %>% 
+  ggplot(aes(y=factor(term, levels = rev(levels(factor(replicated50_sort)))), x=OR, 
+             color=factor(adjustment),20))+
+  geom_errorbar(aes(xmin=lowerCI, xmax=upperCI),position=position_dodge(0.8), size=0.4)+geom_point(position=position_dodge(0.8))+theme_bw()+labs(x="Odds Ratios", y="Protein", color="Model adjusted on")+theme(axis.title=element_text(face="bold"), legend.title = element_text(face="bold"), legend.position = "bottom")+geom_vline(xintercept = 1,color="grey")+ 
+  scale_colour_manual(values=c("Not adjusted (Main analysis)"="#0072B5FF","Smoking intensity, years smoked and years since cessation"="#BC3C29FF"), labels=c("Not adjusted (Main analysis)","Smoking intensity, years smoked\nand years since cessation"))
+  #ggsci::scale_color_nejm(guide = guide_legend(reverse = TRUE))#+
+
+#blue : not adj
+png(paste0(path_save_clean,"figures/sensitivity_adjs_allmokingOR.png"), height=2200, width = 1800, res=280)
+adj_plt
+dev.off()
+
+pdf(paste0(path_save_clean,"figures/sensitivity_adjOR.pdf"))
+adj_plt
+dev.off()
+```
+
+### Cross sectional analysis 
+Assess the effects of risk factors (smoking) on protein concentrations
+seperately in cases, in controls and in the overall dataset 
+### Sup Fig 10
+```{r}
+## function
+prot_univregression <- function(data,protein_l,VR){ 
+  data=data%>%#filter(case_status_u19==0) %>%
+    mutate(quit_years=ifelse(smoke_status=="3",NA,as.numeric(quit_years)))
+  summary_change <- setNames(as.data.frame(matrix(nrow = 1,ncol = 5)),c("Protein","term","estimate","std.error","p.value"))
+  for (i in 1:length(protein_l)) {
+    print("all adj")
+    print(protein_l[i])
+    print(i)
+    model_sum <- tryCatch(lm(as.formula(sprintf("%s ~ %s", paste0(sapply(protein_l[i],as.name)), paste(as.name("cohort_id+age+sex+smoke_status")))), data=data),error=function(e) {data.frame(Protein=protein_l[i],term="age,sex,cohort",estimate=NA,std.error=NA,p.value=NA)})
+    if(class(model_sum) !="data.frame"){
+      model_sum <- model_sum%>%broom::tidy()
+      model_sum <- model_sum%>% filter(term !="(Intercept)") %>% mutate(Protein=protein_l[i])%>%dplyr::select(Protein,term,estimate,std.error,p.value)
+    }
+    summary_change <- bind_rows(summary_change, model_sum)
+    
+    #adding smoking variables that are not adjusted on each other 
+    print("smoking")
+    print(protein_l[i])
+    print(i)
+    for (j in 1:length(VR)){
+      model_smoke <- tryCatch(lm(as.formula(sprintf("%s ~ %s", paste0(sapply(protein_l[i],as.name)), paste("cohort_id+age+sex+smoke_status+",VR[j]))), data=data),error=function(e) {data.frame(Protein=protein_l[i],term=VR[j],estimate=NA,std.error=NA,p.value=NA)})
+      if(class(model_smoke) !="data.frame"){
+        model_smoke <- model_smoke%>%broom::tidy()
+        model_smoke <- model_smoke%>% filter(grepl(VR[j],term)) %>%  mutate(Protein=protein_l[i])%>%dplyr::select(Protein,term,estimate,std.error,p.value)
+       } 
+      summary_change <- bind_rows(summary_change, model_smoke)
+      }
+  }
+  summary_change <- summary_change %>% mutate(adjustment="age,sex,cohort only")
+  summary_change <- summary_change[-1,]
+  return(summary_change)
+}
+
+var <- c("intensity","years_smoked","quit_years","bmi")
+
+association_controls <- prot_univregression(filter(full_data_scaled, case_status_u19==0),replicated_50,var)
+
+# GET ENT FOR THESE PROTEINS (to adjust for multiple comparisons) in corss sectional analysis 
+m1 <- data.matrix(na.omit(full_data_scaled %>% filter(case_status_u19=="0") %>% dplyr::select(all_of(replicated_50[replicated_50 %in% prot_allcohorts]))), rownames.force = NA)
+
+respca <- PCA(m1, ncp=200)
+eigpca <- respca$eig%>%as.data.frame()
+head(eigpca)
+eigpca%>%filter(`cumulative percentage of variance`>94 & `cumulative percentage of variance`<95)%>%tibble::rownames_to_column()%>%slice_max(`cumulative percentage of variance`)#%>%select(rowname) #26
+
+info_summary <- function(data){
+  data%>%mutate(Var_regressed=case_when(grepl("sex",term)~"Female vs. male",
+                                            grepl("age",term)~"Age",
+                                            grepl("bmi",term)~"BMI",
+                                            grepl("smoke_status",term)~"Current vs. Former smokers",
+                                            grepl("intensity",term)~"Cigarettes per day- 10 units increase",
+                                            grepl("years_smoked",term)~"Number of years smoked",
+                                            grepl("quit_years",term)~"quitting years"),
+                                  sig=case_when(
+                                    Protein %in% prot_allcohorts & p.value<0.05/26|Protein %in% protNSHDS_EPIC & p.value<0.05/2~"ENT significant", 
+                                    p.value>=0.05/2 & Protein %in% protNSHDS_EPIC & p.value<0.05 |p.value>=0.05/26& Protein %in% prot_allcohorts & p.value<0.05~"Nominally significant",p.value>=0.05~"Below nominal significance"),
+                                  set=case_when(Protein %in% prot_allcohorts ~ "All cohorts", 
+                                                Protein %in% protNSHDS_EPIC~ "EPIC and NSHDS"), estimate=ifelse(term=="intensity", 10*estimate, as.numeric(estimate)), std.error=ifelse(term=="intensity", 10*std.error, as.numeric(std.error)))
+
+}
+
+association_controls <- prot_univregression(filter(full_data_scaled, case_status_u19==0),replicated_50,var)
+
+table2_sum <- info_summary(association_controls)
+table2_sum %>% arrange(Protein)
+
+write.csv(table2_sum,paste0(path_save_clean, "tables/cross_sectional_var_prt.csv"), row.names = FALSE)
+
+cross_sectional_asso <- table2_sum %>% mutate(sig=factor(sig, levels=c("ENT significant","Nominally significant","Below nominal significance"))) %>% filter(term %in% c("smoke_status","intensity","years_smoked")) %>% ggplot(aes(x=estimate,y=-log10(p.value),color=sig))+
+  geom_point()+
+  geom_label_repel(data=.%>% filter(sig!="Below nominal significance"),aes(label=Protein),size = 3.5,  max.overlaps = getOption("ggrepel.max.overlaps", default = 600), show.legend = FALSE)+
+  geom_hline(yintercept =-log10(0.05), linetype="dashed", color="black")+
+  geom_hline(yintercept =-log10(0.05/26), linetype="dashed", color="darkolivegreen4")+
+  theme_bw()+
+  labs(color="Confidence in associations", x="Change in log-biomarker (standard deviation units)", y="-log10 (p-value)")+theme(legend.position = "bottom", axis.title = element_text(face="bold"))+scale_color_manual(values =  c( "ENT significant" = "#0072b5ff", "Nominally significant" = "#E18727FF","Below nominal significance" = "#BC3C29FF"))+facet_wrap(~Var_regressed,ncol=2)
+
+png(paste0(path_save_clean, "figures/cross_sectional_var.png"),height = 3000,width = 4000, res=450)
+cross_sectional_asso
+dev.off()
+
+plots_protvar <- function(data, var_r){
+  title_plt <- data %>% filter(term==var_r) %>% dplyr::select(Var_regressed) %>% unique() %>% pull(Var_regressed)
+  print(title)
+  plt <- data%>% mutate(sig=factor(sig, levels=c("ENT significant","Nominally significant","Below nominal significance"), labels=c("p<0.05/ENT", "p<0.05","p>=0.05"))) %>% filter(term == var_r) %>% ggplot(aes(x=estimate,y=-log10(p.value),color=sig))+
+  geom_point()+
+  geom_label_repel(data=.%>% filter(sig!="p>=0.05"),aes(label=Protein),size = 3.5,  max.overlaps = getOption("ggrepel.max.overlaps", default = 600), show.legend = FALSE)+
+  #geom_hline(yintercept =-log10(0.05), linetype="dashed", color="black")+
+  #geom_hline(yintercept =-log10(0.05/26), linetype="dashed", color="darkolivegreen4")+
+  theme_bw()+
+  labs(color="Confidence in associations", x="Change in log-biomarker (standard deviation units)", y="-log10 (p-value)",title=paste0(title_plt))+theme(legend.position = "bottom", axis.title = element_text(face="bold"))+scale_color_manual(values=c( "p<0.05/ENT" = "#0072b5ff", "p<0.05" = "#E18727FF","p>=0.05" = "#BC3C29FF"))
+  return(plt)
+}
+
+
+smk_stat <- plots_protvar(table2_sum, "smoke_status")
+intensity <- plots_protvar(table2_sum, "intensity") 
+years_smoke <- plots_protvar(table2_sum, "years_smoked")
+plots_protvar(table2_sum, "bmi")
+
+library(ggpubr)
+
+cross_sect_asso <- ggpubr::ggarrange(
+  ggpubr::annotate_figure(ggpubr::ggarrange(smk_stat+theme(legend.position = "none")+ ggpubr::rremove("xlab"), intensity+theme(legend.position = "none")+ ggpubr::rremove("xlab")),bottom = text_grob("Change in log-biomarker (standard deviation units)", face="bold")), 
+  
+  ggpubr::ggarrange(years_smoke+theme(legend.position = "none"),
+  ggpubr::as_ggplot(ggpubr::get_legend(years_smoke+theme(legend.position = "right", legend.title = element_text(face="bold")))), ncol=2), 
+
+  ncol=1,nrow=2)
+
+png(paste0(path_save_clean, "figures/cross_sectional_var.png"),height = 3000,width = 4000, res=450)
+cross_sect_asso
+dev.off()
+
+pdf(paste0(path_save_clean, "figures/cross_sectional_var.pdf"))
+cross_sect_asso
+dev.off()
+
+
+### in active smoking checking smoking variables 
+##is it a dose response or all or nothing response
+
+var <- c("intensity","years_smoked")
+
+smoking_associations <- prot_univregression(filter(full_data_scaled,smoke_status=="3"),replicated_50,var)
+smoking_associations2 <- info_summary(smoking_associations)
+
+write.csv(smoking_associations2,paste0(path_save_clean, "tables/cross_sectional_currentsmokers.csv"), row.names = FALSE)
+
+
+plots_protvar(smoking_associations2, "intensity") 
+plots_protvar(smoking_associations2, "years_smoked") 
+
+# #########################################
+# on cases 
+
+association_cases <- prot_univregression(filter(full_data_scaled, case_status_u19==1),replicated_50,var)
+
+table2_sum_cases <- info_summary(association_cases)
+association_cases %>% arrange(Protein)
+
+write.csv(table2_sum_cases,paste0(path_save_clean, "tables/cross_sectional_var_prt_cases.csv"), row.names = FALSE)
+
+cross_sectional_asso_cases <- table2_sum_cases %>% mutate(sig=factor(sig, levels=c("ENT significant","Nominally significant","Below nominal significance"))) %>% filter(term %in% c("smoke_status","intensity","years_smoked")) %>% ggplot(aes(x=estimate,y=-log10(p.value),color=sig))+
+  geom_point()+
+  geom_label_repel(data=.%>% filter(sig!="Below nominal significance"),aes(label=Protein),size = 3.5,  max.overlaps = getOption("ggrepel.max.overlaps", default = 600), show.legend = FALSE)+
+  geom_hline(yintercept =-log10(0.05), linetype="dashed", color="black")+
+  geom_hline(yintercept =-log10(0.05/26), linetype="dashed", color="darkolivegreen4")+
+  theme_bw()+
+  labs(color="Confidence in associations", x="Change in log-biomarker (standard deviation units)", y="-log10 (p-value)")+theme(legend.position = "bottom", axis.title = element_text(face="bold"))+scale_color_manual(values =  c( "ENT significant" = "#0072b5ff", "Nominally significant" = "#E18727FF","Below nominal significance" = "#BC3C29FF"))+facet_wrap(~Var_regressed,ncol=2)
+
+png(paste0(path_save_clean, "figures/cross_sectional_var_cases.png"),height = 3000,width = 4000, res=450)
+cross_sectional_asso_cases
+dev.off()
+
+
+smk_stat_cases <- plots_protvar(table2_sum_cases, "smoke_status")
+intensity_cases <- plots_protvar(table2_sum_cases, "intensity") 
+years_smoke_cases <- plots_protvar(table2_sum_cases, "years_smoked")
+
+
+library(ggpubr)
+cross_sect_asso_cases <- ggpubr::ggarrange(
+  ggpubr::annotate_figure(ggpubr::ggarrange(smk_stat_cases+theme(legend.position = "none")+ ggpubr::rremove("xlab"), intensity_cases+theme(legend.position = "none")+ ggpubr::rremove("xlab")),bottom = text_grob("Change in log-biomarker (standard deviation units)", face="bold")), 
+  
+  ggpubr::ggarrange(years_smoke_cases+theme(legend.position = "none"),
+  ggpubr::as_ggplot(ggpubr::get_legend(years_smoke_cases+theme(legend.position = "right", legend.title = element_text(face="bold")))), ncol=2), 
+
+  ncol=1,nrow=2)
+
+png(paste0(path_save_clean, "figures/cross_sectional_var_cases.png"),height = 3000,width = 4000, res=450)
+cross_sect_asso_cases
+dev.off()
+
+##############################
+#overall on the full study group
+#ADD ADJUSTMENT ON CASE STATUS !
+
+prot_univregression_adj <- function(data,protein_l,VR){ #dont forget to transform to factors the necessary variables
+  data=data%>%
+    mutate(quit_years=ifelse(smoke_status=="3",NA,as.numeric(quit_years)))
+  summary_change <- setNames(as.data.frame(matrix(nrow = 1,ncol = 5)),c("Protein","term","estimate","std.error","p.value"))
+  for (i in 1:length(protein_l)) {
+    print("all adj")
+    print(protein_l[i])
+    print(i)
+    model_sum <- tryCatch(lm(as.formula(sprintf("%s ~ %s", paste0(sapply(protein_l[i],as.name)), paste(as.name("cohort_id+age+sex+smoke_status+case_status_u19")))), data=data),error=function(e) {data.frame(Protein=protein_l[i],term="age,sex,cohort",estimate=NA,std.error=NA,p.value=NA)})
+    if(class(model_sum) !="data.frame"){
+      model_sum <- model_sum%>%broom::tidy()
+      model_sum <- model_sum%>% filter(term !="(Intercept)") %>% mutate(Protein=protein_l[i])%>%dplyr::select(Protein,term,estimate,std.error,p.value)
+    }
+    summary_change <- bind_rows(summary_change, model_sum)
+
+    #adding smoking variables that are not adjusted on each other
+    print("smoking")
+    print(protein_l[i])
+    print(i)
+    for (j in 1:length(VR)){
+      model_smoke <- tryCatch(lm(as.formula(sprintf("%s ~ %s", paste0(sapply(protein_l[i],as.name)), paste("cohort_id+age+sex+smoke_status+case_status_u19+",VR[j]))), data=data),error=function(e) {data.frame(Protein=protein_l[i],term=VR[j],estimate=NA,std.error=NA,p.value=NA)})
+      if(class(model_smoke) !="data.frame"){
+        model_smoke <- model_smoke%>%broom::tidy()
+        model_smoke <- model_smoke%>% filter(grepl(VR[j],term)) %>%  mutate(Protein=protein_l[i])%>%dplyr::select(Protein,term,estimate,std.error,p.value)
+       }
+      summary_change <- bind_rows(summary_change, model_smoke)
+      }
+  }
+  summary_change <- summary_change %>% mutate(adjustment="age,sex,cohort only")
+  summary_change <- summary_change[-1,]
+  return(summary_change)
+}
+
+
+
+association_overall <- prot_univregression_adj(full_data_scaled,replicated_50,var)
+
+table2_sum_overall <- info_summary(association_overall)
+association_overall %>% arrange(Protein)
+
+write.csv(table2_sum_overall,paste0(path_save_clean, "tables/cross_sectional_var_prt_overall.csv"), row.names = FALSE)
+
+cross_sectional_asso_overall <- table2_sum_overall %>% mutate(sig=factor(sig, levels=c("ENT significant","Nominally significant","Below nominal significance"))) %>% filter(term %in% c("smoke_status","intensity","years_smoked")) %>% ggplot(aes(x=estimate,y=-log10(p.value),color=sig))+
+  geom_point()+
+  geom_label_repel(data=.%>% filter(sig!="Below nominal significance"),aes(label=Protein),size = 3.5,  max.overlaps = getOption("ggrepel.max.overlaps", default = 600), show.legend = FALSE)+
+  geom_hline(yintercept =-log10(0.05), linetype="dashed", color="black")+
+  geom_hline(yintercept =-log10(0.05/26), linetype="dashed", color="darkolivegreen4")+
+  theme_bw()+
+  labs(color="Confidence in associations", x="Change in log-biomarker (standard deviation units)", y="-log10 (p-value)")+theme(legend.position = "bottom", axis.title = element_text(face="bold"))+scale_color_manual(values =  c( "ENT significant" = "#0072b5ff", "Nominally significant" = "#E18727FF","Below nominal significance" = "#BC3C29FF"))+facet_wrap(~Var_regressed,ncol=2)
+
+png(paste0(path_save_clean, "figures/cross_sectional_var_overall.png"),height = 3000,width = 4000, res=450)
+cross_sectional_asso_overall
+dev.off()
+
+
+smk_stat_overall <- plots_protvar(table2_sum_overall, "smoke_status")
+intensity_overall <- plots_protvar(table2_sum_overall, "intensity")
+years_smoke_overall <- plots_protvar(table2_sum_overall, "years_smoked")
+
+
+library(ggpubr)
+cross_sect_asso_overall <- ggpubr::ggarrange(
+  ggpubr::annotate_figure(ggpubr::ggarrange(smk_stat_overall+theme(legend.position = "none")+ ggpubr::rremove("xlab"), intensity_overall+theme(legend.position = "none")+ ggpubr::rremove("xlab")),bottom = text_grob("Change in log-biomarker (standard deviation units)", face="bold")),
+
+  ggpubr::ggarrange(years_smoke_overall+theme(legend.position = "none"),
+  ggpubr::as_ggplot(ggpubr::get_legend(years_smoke_overall+theme(legend.position = "right", legend.title = element_text(face="bold")))), ncol=2),
+
+  ncol=1,nrow=2)
+
+png(paste0(path_save_clean, "figures/cross_sectional_var_overall.png"),height = 3000,width = 4000, res=450)
+cross_sect_asso_overall
+dev.off()
+```
+# ###########################################################################
+# ###########################################################################
+# Stratified Analysis 
+stratify by histology, smoking status , lagtime , sex  , cohort id 
+- we need to make sure that smoking status and sex are factors => yes in function 
+- create strat levels for lagtime  
+
+## Create data strata/groupings
+```{r}
+#create lagtime categories 0-1, 1-2,2-3
+#do it only for cases, and match the same  cat for their matched control 
+full_data_scaled <- full_data_scaled%>%mutate(cat_lagtime=ifelse(case_status_u19==1,case_when(followup_lc<=1~"0-1",followup_lc>1 & followup_lc<=2~"1-2", followup_lc>2~"2-3"),NA))
+
+table(full_data_scaled$cat_lagtime, useNA="always")
+with(full_data_scaled, table(case_status_u19, cat_lagtime, useNA="always"))
+by(full_data_scaled$followup_lc, full_data_scaled$cat_lagtime, summary) #OK
+
+#now match controls to the same lag_cat as their matched case 
+full_data_scaled <- full_data_scaled%>%group_by(caseset)%>%tidyr::fill(cat_lagtime, .direction="updown")%>%ungroup()
+with(full_data_scaled,table(case_status_u19, cat_lagtime, useNA="always")) #ok 
+
+# list of stratum for lagtime 
+lagtime_lst <- levels(as.factor(full_data_scaled$cat_lagtime))
+
+# by BMI 
+# below 18.5 – you're in the underweight range.
+# between 18.5 and 24.9 – you're in the healthy weight range.
+# between 25 and 29.9 – you're in the overweight range.
+# between 30 and 39.9 – you're in the obese range.
+full_data_scaled <-full_data_scaled %>% mutate(bmi_cat=ifelse(case_status_u19=="1",case_when(bmi<18.5~"underweight", bmi>=18.5 & bmi<25~"normal", bmi>=25 &bmi<30~"overweight", bmi>=30~"obese"),as.character(NA)), overweight=ifelse(case_status_u19=="1", case_when(bmi<25~"low/normal", bmi>=25~"high"), as.character(NA)))
+
+with(full_data_scaled, table(case_status_u19, bmi_cat))
+
+full_data_scaled <- full_data_scaled%>%group_by(caseset)%>%tidyr::fill(bmi_cat, .direction="updown")%>%ungroup()
+full_data_scaled <- full_data_scaled%>%group_by(caseset)%>%tidyr::fill(overweight, .direction="updown")%>%ungroup()
+
+with(full_data_scaled, table(case_status_u19, bmi_cat))
+```
+Run analysis 
+```{r}
+###################################
+#get stratified results # bmicat and packyears cat?
+library(dplyr)
+library(survival)
+strat_OR <- strat_clogits(full_data_scaled, replicated_50, c("Histology_u19","smoke_status","cat_lagtime","sex","tnm_all","cohort_id"))
+
+strat_OR%>%arrange(protein)
+strat_OR%>%filter(Variable=="bmi_cat")%>%arrange(protein)
+#add lower and upper CI 
+
+#remame histology and lagtime with nice names without _
+strat_OR2 <- strat_OR%>%mutate(strat_column=dplyr::recode(strat_column,`0-1`="<1 year", `1-2`="1-2 years", `2-3`="2-3 years"), lowerCI=exp(beta-1.96*sd),upperCI=exp(beta+1.96*sd), 
+                               Variable=ifelse(strat_column=="Overall","Overall",as.character(Variable)),
+                               strat_column=case_when(Variable=="sex" & strat_column=="1"~ "male",Variable=="sex" & strat_column=="2"~ "female", Variable=="smoke_status" & strat_column=="2"~ "Former smokers",Variable=="smoke_status" & strat_column=="3"~ "Current smokers",T~as.character(strat_column)))%>%
+  dplyr::select(protein, Variable,strat_column, OR, lowerCI, upperCI, pvalue, beta, sd, tot_obs, `cases/controls`)#%>%group_by(protein)%>%arrange(protein, factor(Variable,levels=c("Overall","Histology_u19","smoke_status","cat_lagtime","sex","bmi_cat","cohort_id"), labels = c("Overall", "Histology","Smoking","Lagtime", "Sex","bmi")),factor(strat_column,levels=c("Overall","Adenocarcinoma","Large Cell Carcinoma","Small Cell Carcinoma","Squamous Cell Carcinoma","Other/NOS","Former smokers","Current smokers","<1 year","1-2 years","2-3 years","male","female","EPIC","NSHDS","CPS","HUNT","MCCS","SCHS"))) %>% ungroup()
+write.csv(strat_OR2,paste0(path_save,"stratified analysis/all_strata_OR_ordered.csv"), row.names = FALSE)
+```
+
+# Heterogeneity measures (phet- compare strata)
+chisq 
+```{r}
+## for histology we will only compare adeno and squamous for power reasons 
+strat_OR_sel <- strat_OR2 %>% filter(case_when(Variable=="Histology_u19"~strat_column %in% c("Adenocarcinoma","Squamous Cell Carcinoma"), T~Variable !="Histology_u19"))
+
+strat_hetero <- chisq_strata_prot(strat_OR_sel, replicated_50, c("Histology_u19","smoke_status","cat_lagtime","sex","cohort_id","tnm_all"))
+
+
+write.csv(strat_hetero, paste0(path_save,"stratified analysis/hetero_prot_strata.csv"), row.names = FALSE)
+
+strat_hetero %>% filter(Variable=="sex",phet<0.05) %>% View #%>% distinct(protein, .keep_all = TRUE) %>% arrange(phet)
+
+strat_hetero_cleantable <- strat_hetero %>% mutate(`OR (95% CI)`=paste0(formatC(OR,digits = 2,format = "f"), " (",formatC(lowerCI, digits = 2,format="f"),", ",formatC(upperCI, digits = 2, format = "f"),")")) %>% dplyr::select(protein,Variable, strat_column , tot_obs, `cases/controls`, `OR (95% CI)`, phet)
+#strata_OR_all2
+
+strat_hetero %>% filter(Variable=="tnm_all", phet<0.05) %>% arrange(protein)
+
+strat_hetero %>% filter(Variable=="bmi_cat") %>% arrange(protein)
+strat_hetero %>% filter(protein=="ALPP", Variable=="Histology_u19")
+```
+
+# stratified OR by stage 
+1) ORs by stage 
+2) AUCs for the 36 proteins by stage  in same table 
+# Sup Data 7
+```{r}
+full_data_scaled$tnm_all %>% table(useNA = "always") #60% missing info .. 
+
+with(full_data_scaled, table(tnm_all, case_status_u19, useNA = "always"))
+# OR all proteins volcano plot by stage
+allprot_OR_stage <- strat_clogits(full_data_scaled, all_proteins_list2, c("tnm_all"))
+
+
+OR_plot_allport <- allprot_OR_stage %>% filter(OR<100, strat_column!="Overall") %>% add_count(protein) %>% filter(n==2) %>% dplyr::select(protein, OR, strat_column) %>% filter(strat_column !="Overall") %>% tidyr::pivot_wider(names_from = strat_column, values_from = OR) %>% ggplot(aes(x=`stage1-2`, y=`stage3-4`))+geom_point()+geom_abline(intercept=0, slope=1)+xlim(c(0,8))+ylim(c(0,8))+labs(x="OR for stage 1 and 2", y="OR for stage 3 and 4")+theme_bw()
+
+# in replicated 50 we also needs AUCs
+lateStage_AUC <- aucs_model_prot(filter(full_data_scaled, tnm_all=="stage3-4" ), replicated_50, "latestage_aucs.csv")
+early_stage_AUC <-  aucs_model_prot(filter(full_data_scaled, tnm_all=="stage1-2" ), replicated_50, "earlystage_aucs.csv")
+AUC_prot_stage <- bind_rows(`stage1-2`=early_stage_AUC, `stage3-4`=lateStage_AUC, .id = "strat_column")
+
+AUC_prot_stage
+identified_protORstage
+
+identified_protORstage2 <- AUC_prot_stage%>%mutate(lowerCI=exp(beta-1.96*sd),
+                                                           upperCI=exp(beta+1.96*sd),
+                                                   Variable="tnm_all")%>%
+  dplyr::select(protein, Variable,strat_column, OR, lowerCI, upperCI, pvalue, beta, sd,tot_obs,
+                auc_plco_protcc_data,auc_prot,auc_plco_prot,
+                auc_CI_plco_cc,auc_CI_prot,auc_CI_plco_prot,
+                nobs_plcoauc_cc,nobs_auc_prot,nobs_auc_plcoprot,delta_auc_prot)
+
+strat_hetero_stage <- chisq_strata_prot(identified_protORstage2, replicated_50, c("tnm_all"))
+
+strat_hetero_stage %>% arrange(protein) %>% relocate(phet, .before=5)  #OK looks good, ok all nobs_aucs are the same-> we can remove them (or just keep one)
+
+# format table for saving 
+table_stage_OR_AUC <- strat_hetero_stage %>% 
+  mutate(ORci=paste0(formatC(OR, digits = 2, format="f"), " (", 
+                     formatC(lowerCI, digits = 2, format="f"),"-",formatC(upperCI, digits = 2, format="f"), ")"),
+         across(c("phet", "pvalue"), ~formatC(.,digits=2, format="e")),
+         auc_prot_ci=paste0(formatC(auc_prot, digits=2, format="f")," (", auc_CI_prot, ")"),
+         auc_plco_ci=paste0(formatC(auc_plco_protcc_data, digits = 2, format="f"), " (",auc_CI_plco_cc, ")"),
+         auc_plco_prot_ci=paste0(formatC(auc_plco_prot, digits = 2, format = "f"), " (", auc_CI_plco_prot, ")"),
+         delta_auc_prot=formatC(delta_auc_prot, digits=2, format="f")) %>% 
+  dplyr::select(protein, strat_column, ORci, pvalue, phet, tot_obs, auc_prot_ci, auc_plco_ci,auc_plco_prot_ci,delta_auc_prot,nobs_auc_plcoprot)
+
+
+protein_higherdelta_stage1 <- table_stage_OR_AUC %>% dplyr::select(protein, strat_column, delta_auc_prot) %>% pivot_wider(names_from = strat_column, values_from = delta_auc_prot) %>% filter(`stage1-2`>`stage3-4`) %>% pull(protein) #17
+protein_higherdelta_stage1 %>% length()
+
+table_stage_OR_AUC <- table_stage_OR_AUC %>% mutate(higher_increase_stage1=ifelse(protein %in% protein_higherdelta_stage1, "Higher increase in deltas AUCs for early stage",  "Lower increase in deltas AUCs for early stage"))
+write.csv(table_stage_OR_AUC, paste0(path_save_clean, "tables/suptable7_stageAUC_OR.csv"), row.names = FALSE)
+```
+
+## save stratified analysis 
+Remove pvalue rows 
+Remove n cases and add co : max N case set per stratum
+# Sup Data 8
+```{r}
+library(openxlsx)
+strat_hetero%>%filter(phet<0.05)%>%arrange(protein)
+
+unfill_vec <- function(x) {
+  same <- x == dplyr::lag(x)
+  ifelse(!is.na(same) & same, NA, x)
+}
+
+stratified_OR_rep50 <- strat_hetero %>% filter(protein %in% replicated_50)
+
+
+table2_sup_strat <- stratified_OR_rep50 %>%mutate(Variable=case_when(Variable=="Histology_u19"~"Histology", Variable=="smoke_status"~"Smoking", Variable=="cat_lagtime"~"Lagtime", Variable=="sex"~"Sex", Variable=="tnm_all"~"Stage", Variable=="cohort_id"~"Cohort", T~as.character(Variable))) %>% 
+  arrange(protein, factor(Variable, levels = c("Overall", "Histology","Stage", "Smoking","Lagtime", "Sex")),factor(strat_column,levels=c("Overall","Adenocarcinoma","Squamous Cell Carcinoma","stage1-2","stage3-4","Former smokers","Current smokers","<1 year","1-2 years","2-3 years","male","female","EPIC","NSHDS","CPS","HUNT","MCCS","SCHS")))  %>%
+  mutate(ORCI=paste0(sprintf('%.2f',OR)," (",sprintf('%.2f',lowerCI),", ",sprintf('%.2f',upperCI),")"),totobs=as.character(tot_obs),across(c("pvalue","phet"), ~formatC(., format = "e", digits = 2)))  %>%group_by(protein) %>%
+  mutate(tot_obs=ifelse(Variable=="Overall",NA,as.numeric(tot_obs)),Nmax_strata=max(tot_obs,na.rm = TRUE)) %>% ungroup() %>% dplyr::select(protein, strat_column, ORCI,phet,Nmax_strata)%>%
+  tidyr::pivot_wider(names_from = strat_column, values_from = c("ORCI","phet"))%>%
+  tidyr::pivot_longer( cols = !c("protein","Nmax_strata"),
+  names_to = c('measure','.value'),
+  names_pattern = '(.*?)(_.*)') %>% group_by(protein) %>%
+  mutate(protein=unfill_vec(protein),Nmax_strata=unfill_vec(Nmax_strata)) %>% ungroup()%>%
+  mutate(across(everything(),~ifelse(is.na(.)|.=="NA"|.==" NA","",.)))%>% rename_with(~ gsub("^_","", .x), everything())  %>% mutate(measure=case_when(measure=="ORCI"~"OR (95%CI)",measure=="totobs"~"Nb of casesets",T~measure))# %>% write.csv(paste0(path_save_clean,"tables/strat_OR_suptable.csv"), row.names = FALSE)
+
+
+strat_hetero_cleantable2 <- strat_hetero_cleantable%>% filter(protein %in% replicated_50, Variable!="tnm_all")%>%dplyr::select(-c("cases/controls","Variable")) %>%  dplyr::rename(total_casesets=tot_obs)%>%mutate(`OR (95% CI)`=paste0(`OR (95% CI)`,"<br> N casesets=",total_casesets)) %>% dplyr::select(-total_casesets) %>% 
+  tidyr::pivot_wider(names_from = strat_column, values_from = c("OR (95% CI)","phet"))%>%
+  mutate(across(everything(),~ifelse(is.na(.)|.=="NA"|.==" NA","",.)))%>% rename_with(~ gsub("^_","", .x), everything())
+
+write.csv(strat_hetero_cleantable2, file=paste0(path_save_clean, "tables/strat_OR.csv"))
+```
+
+Supplementary figures concerning strata ORs 
+###Sup Fig 5
+```{r}
+OR_stage <- stratified_OR_rep50 %>% filter(Variable=="tnm_all") %>% dplyr::select(protein, strat_column, OR) %>% tidyr::pivot_wider(id_cols=protein, names_from="strat_column", values_from = "OR") %>% 
+  ggplot(aes(x=`stage1-2`, y=`stage3-4`))+geom_point()+theme_bw()+
+  ggrepel::geom_label_repel(aes(label=protein), max.overlaps=200)+geom_abline(slope=1, intercept = 0)+
+  labs(x="OR for stage 1 and 2", y="OR for stage 3 and 4")+xlim(c(0.5,3.1))+ylim(c(0.5,3.1))
+
+png(paste0(path_save_clean, "figures/OR_OR_stage_supfigure.png"), height=1800, width=2400,res=250)
+OR_stage
+dev.off()
+
+stratified_OR_rep50 %>% filter(Variable=="tnm_all", protein=="SPINT1")
+
+png(paste0(path_save_clean, "figures/Z_Z_stage.png"), height=1800, width=2400,res=250)
+stratified_OR_rep50 %>% filter(Variable=="tnm_all") %>%mutate(z_score=beta/sd) %>%  dplyr::select(protein, strat_column, z_score) %>% tidyr::pivot_wider(id_cols=protein, names_from="strat_column", values_from = "z_score") %>% ggplot(aes(x=`stage1-2`, y=`stage3-4`))+geom_point()+theme_bw()+ggrepel::geom_label_repel(aes(label=protein), max.overlaps=200)+geom_abline(slope=1, intercept = 0)+labs(x="z for stage 1 and 2", y="z for stage 3 and 4")+geom_hline(yintercept=c(-1.96,1.96), color="grey")+geom_vline(xintercept = c(-1.96,1.96), color="grey")
+dev.off()
+```
+
+
+### p-trend analysis for lagtime
+### Sup Fig 8
+=> type of regression:linear filtered only to cases prot~lagtime
+```{r}
+#create new numeric variable for 1 years lagtime ,2,3 
+#run linear regressions for beta
+#type of regression:linear filtered only to cases prot~lagtime. adjusted on age, sex, smoking status,  cohort, (bmi ?)
+
+full_data_scaled <- full_data_scaled%>%mutate(cat_lagtime_numeric=case_when(cat_lagtime=="0-1"~1, cat_lagtime=="1-2"~2, cat_lagtime=="2-3"~3))
+with(full_data_scaled, table(cat_lagtime, cat_lagtime_numeric, useNA="always"))
+
+
+##interaction protein*lagtime , (conditional log reg : outcome  case_status)
+p_trend <- function(x, vect_biom){
+  
+  p_trend_value <- data.frame(marker=NA, estimate=NA, p.value=NA, statistic=NA)
+  for (i in 1:length(vect_biom)) {
+    a <- tryCatch(clogit(as.formula(sprintf("case_status_u19~ %s", paste(sapply(vect_biom[i], as.name), "+",sapply(vect_biom[i], as.name),":cat_lagtime_numeric+ strata(caseset)", sep=""))),x)%>%broom::tidy(),error=function(e){data.frame(marker=vect_biom[i], estimate=NA, std.error=NA,statistic=NA,p.value=NA)})
+    
+    a <- a%>%as.data.frame()%>%filter(grepl("cat_lagtime_numeric", term))
+    a <- a%>%mutate(marker=paste(vect_biom[i]))%>%dplyr::select(marker,estimate, p.value,statistic)
+    p_trend_value <- bind_rows(p_trend_value,a)
+    }
+  p_trend_value <- na.omit(p_trend_value)
+  p_trend_value <- p_trend_value%>%dplyr::rename(p.trend.value="p.value")
+  return(p_trend_value)
+}
+
+
+lagtime_trend <- p_trend(full_data_scaled, replicated_50) 
+
+lagtime_trend <- lagtime_trend %>% mutate(across(c(estimate,statistic),~formatC(.,format="f", digits = 2)), p.trend.value=formatC(p.trend.value, format="e",digits=2))
+
+
+write.csv(lagtime_trend, paste0(path_save_clean,"tables/lagtime_trend.csv"), row.names = FALSE) #as sup table 4c 
+
+## plot with strat ORs
+
+plot_trend_wide <- strat_hetero%>%filter(protein %in% replicated_50, Variable=="cat_lagtime")%>%dplyr::rename(marker=protein)%>%merge(lagtime_trend, by="marker", all.x = TRUE, all.y = FALSE)%>%filter(as.numeric(p.trend.value)<0.05)%>%mutate(p_value_trend=paste0("trend pvalue=", p.trend.value))%>%ggplot(aes(x=strat_column, y=OR))+geom_pointrange(aes(ymin=lowerCI, ymax=upperCI))+labs(x="Time to diagnosis", y="Odds Ratio")+theme_bw()+theme(axis.text.x = element_text(angle = 45,hjust=1), plot.caption = element_text(hjust = 0), axis.title = element_text(face = "bold"))+ geom_hline(yintercept=1,linetype="dashed", alpha=0.3)+facet_wrap(~marker+p_value_trend, ncol=3)
+
+#,panel.border = element_rect(linetype = "solid", fill = NA),panel.grid.major = element_line(colour = "grey")
+
+png(paste0(path_save_clean,"figures/OR_lagtime_trend.png"), height = 2000,width=2200, res=280)
+plot_trend_wide
+dev.off()
+
+pdf(paste0(path_save_clean,"figures/OR_lagtime_trend.pdf"))
+plot_trend_wide
+dev.off()
+```
+
+## Sup Fig 7, 8, 9
+```{r}
+#Histolgy 
+
+hist_strat_plot <- strat_hetero%>%filter(protein %in% replicated_50)%>%mutate(phet2=paste0(protein, ", \nphet=",formatC(phet, format = "e", digits = 2)))%>%
+  filter(Variable=="Histology_u19", round(phet,3)<0.05, strat_column!="Other/NOS")%>%
+  ggplot(aes(y=phet2, x=OR, color=strat_column))+
+  geom_pointrange(aes(xmin=lowerCI,xmax=upperCI), position = position_dodge(0.3))+
+  labs(y="Protein",x="Odds Ratio", color="Histology")+theme_bw()+theme(legend.title  = element_text(face = "bold"),axis.title = element_text(face="bold"))+geom_vline(xintercept=1,linetype="dashed", alpha=0.3)+coord_cartesian(xlim=c(0, 6))+scale_color_nejm()#+facet_wrap(~protein+phet2, ncol=2)
+
+png(paste0(path_save_clean,"figures/OR_heter_hist.png"), height = 1500,width=2200, res=280)
+hist_strat_plot
+dev.off()
+
+# pdf(paste0(path_save_clean,"figures/OR_heter_hist.pdf"),height=4)
+# hist_strat_plot
+# dev.off()
+
+# smoking status 
+smoking_strat_OR <- strat_hetero%>%filter(protein %in% replicated_50)%>%mutate(phet2=ifelse(round(phet,digits=2)==0,paste0("phet<0.01"),paste0("phet=",round(phet,digits=2))),strat_column=case_when(strat_column=="Current smokers"~"Current",strat_column=="Former smokers"~"Former", T~as.character(strat_column)))%>%filter(Variable=="smoke_status",phet<0.05) %>%mutate(prot_het=paste0(protein,",\n", phet2)) %>%
+  ggplot(aes(x=OR, y=prot_het, color=strat_column))+
+  geom_pointrange(aes(xmin=lowerCI,xmax=exp(log(OR)+1.96*sd)),position=position_dodge(0.8))+
+  theme_bw()+theme(axis.title.x=element_text(face="bold"),axis.title.y=element_text(face="bold"), legend.title = element_text(face="bold"))+
+  geom_vline(xintercept=1,linetype="dashed", alpha=0.3)+
+  labs(color="Smoking status", x="Odds Ratio", y="Protein")+scale_color_nejm()
+
+png(paste0(path_save_clean,"figures/OR_heter_smoking.png"), height = 1500,width=2200, res=280)
+smoking_strat_OR
+dev.off()
+```
+
+#  Asian markers  
+### stratify by groups of cohorts and calculate heterogeneity 
+- all cohorts except for SCHS vs SCHS 
+```{r}
+#create a new column assigning all but SCHS or SCHS as cohort 
+
+full_data_scaled <- full_data_scaled%>%mutate(cohorts_bySCHS=case_when(cohort_id=="SCHS"~" Asian (SCHS)",race=="1"|cohort_id %in% c("HUNT","NSHDS")~"White (Other cohorts)"))
+
+
+with(full_data_scaled, table(cohort_id, cohorts_bySCHS))
+
+#ENT SCHS => 106
+disc_SCHS <- univ_clogits(filter(full_data_scaled,cohort_id=="SCHS"), protSCHS)
+
+disc_SCHS %>% filter(pvalue<0.05/106) %>% mutate(lci=exp(beta-1.96*sd), uci=exp(beta+1.96*sd), CI=paste0(sprintf("%.2f",OR)," (",sprintf("%.2f",lci),", " , sprintf("%.2f",uci), ")"), pvalue=formatC(pvalue, format = "e", digits = 2)) %>% dplyr::select(protein, CI, pvalue,z_stat,tot_obs) %>% write.csv(paste0(path_save_clean,"tables/discovery_SCHS.csv"),row.names = FALSE)
+
+
+#calculate stratified OR 
+
+SCHS_vscohorts2 <- strat_clogits(full_data_scaled,c("RFNG","S100A4"),"cohorts_bySCHS")
+
+SCHS_vscohorts2 <- SCHS_vscohorts2%>%filter(strat_column!="Overall")
+SCHS_vsCohorts_het2 <- chisq_strata_prot(SCHS_vscohorts2,c("RFNG","S100A4"), c("cohorts_bySCHS"))
+
+
+SCHS_vsCohorts_het2%>%arrange(protein) %>% mutate(ORCI=paste0(sprintf("%.2f",OR)," (",sprintf("%.2f",exp(beta-1.96*sd)),", " ,sprintf("%.2f",exp(beta+1.96*sd)),")")) %>% dplyr::select(protein,Variable,strat_column,ORCI,pvalue, phet, z_stat, tot_obs)%>% write.csv(paste0(path_save_clean,"tables/comparisonSCHS_cohorts.csv"),row.names = FALSE)
+
+#geom_errorbar(aes(xmin=lowerCI, xmax=upperCI),position=position_dodge(0.8), size=0.4)+geom_point(position=position_dodge(0.8))
+SCHS_disc_prot <-SCHS_vsCohorts_het2%>%filter(strat_column!="Other/NOS")%>%mutate(prot_het=paste0(protein, ",\nphet=", formatC(phet,format="e", digits = 2)))%>%
+  ggplot(aes(x=as.numeric(OR), y=prot_het,color=strat_column))+
+  geom_pointrange(aes(xmin=exp(log(OR)-1.96*sd), xmax=exp(log(OR)+1.96*sd)),position=position_dodge(0.8))+
+  geom_vline(xintercept = 1,linetype="dashed",alpha=0.3)+theme_bw()+
+  theme(axis.title.x=element_text(face="bold"),axis.title.y=element_text(face="bold"), legend.title = element_text(face="bold"))+
+  labs(y="Protein", x="Odds Ratio", color="Cohort set")+scale_color_nejm()
+
+png(paste0(path_save_clean,"figures/Asianmarkers.png"),height = 1000, width = 1800,res=250)
+SCHS_disc_prot
+dev.off()
+
+pdf(paste0(path_save_clean,"figures/Asianmarkers.pdf"),height=4)
+SCHS_disc_prot
+dev.off()
+SCHS_vsCohorts_het2%>%filter(strat_column!="Other/NOS")%>%mutate(prot_het=paste0(protein, ",\nphet=", formatC(phet,format="e", digits = 2))) %>% mutate(lowerCI=exp(log(OR)-1.96*sd),upperCI=exp(log(OR)+1.96*sd)) %>% arrange(protein) %>% relocate(strat_column, protein, OR, lowerCI, upperCI) 
+```
+
+# time-lag-stage 
+## Sup Fig 6
+estimate the stage at blood draw from followup time and the mean sojourn time (ten haad & de konning, cebp 2015)
+
+```{r}
+#stage tnmm :tnm_all 
+full_data_scaled$cohort_id %>% table(useNA = "always")
+with(full_data_scaled, table(lc_tnm_stage, tnm_over)) # chose LC tnm stage 
+with(filter(full_data_scaled,case_status_u19==1, cohort_id=="CPS" ), table(lc_tnm_stage, other_stage, useNA = "always"))
+
+#for CPS, assume the latest of the subtages 
+
+full_data_scaled <- full_data_scaled %>% mutate(MPS_stage=ifelse(cohort_id!="CPS", lc_tnm_stage, 
+                                             case_when(other_stage==1~"1B", 
+                                                       other_stage==2~"2B",
+                                                       other_stage==3~"3B", 
+                                                       other_stage==4~"4", 
+                                                       T~as.character(NA))))
+
+
+
+# create a column of stage at diagnosis based on de knoning et al 
+library(readxl)
+MST_stage_sex <- read_excel(paste0(path_general,"Data/time_stageshift_deKoning_CEBP2015.xlsx"))
+MST_stage_sex$to %>% unique()
+
+MST_stage_sex$AD[1]
+
+
+MST_stage_sex <- MST_stage_sex %>% mutate(across(c("from", "to"), ~case_when(.=="IA"~"1A", 
+                                                                            .=="IB"~"1B",
+                                                                            .=="II"~"2B",
+                                                                            .=="IIIA"~"3A",
+                                                                            .=="IIIB"~"3B", 
+                                                                            .=="IV"~"4", T~as.character(.))))%>%  
+  tidyr::pivot_longer(c("AD", "SQ","OTH", "SM"), names_to = "histology", values_to = "years_1stage")
+
+
+full_data_scaled$MPS_stage %>% unique() #"1B" NA   "2B" "3B" "4"  "3A" "1A"
+MST_stage_sex %>% filter(to<="3A") #OK
+
+estimate_stage <- function(sex1,hist,stage_diag, followup_time){
+  if (!is.na(stage_diag)){
+    gender_f <- ifelse(sex1==1, "Men","Women")
+  #print(gender_f)
+  histology_f <-case_when(hist=="Adenocarcinoma"~"AD",
+                        hist=="Squamous Cell Carcinoma"~"SQ",
+                        hist=="Small Cell Carcinoma"~"SM",
+                        T~"OTH") 
+  
+  datax <- MST_stage_sex %>% filter(gender==gender_f, histology==histology_f,to<=stage_diag) %>%
+    arrange(desc(to))%>%
+    mutate(final_to=stage_diag, sumyears=cumsum(years_1stage)) %>% 
+    add_row(from=stage_diag,sumyears=0,final_to=stage_diag) %>% 
+    filter(sumyears<=followup_time) %>% slice_max(sumyears)
+    #filter(sumyears>=followup_time) %>% slice_min(sumyears)
+  print(datax)
+  stage_blood_draw=datax %>% pull(from)
+  
+  }
+  else{
+    stage_blood_draw <- as.character(NA)
+  }
+  return(stage_blood_draw)
+}
+estimate_stage(1,"Adenocarcinoma","3B",0.36) 
+estimate_stage(1,"Adenocarcinoma","3B",0.40) 
+
+with(full_data_scaled[2,], estimate_stage(sex, Histology_u19, MPS_stage, followup_lc))
+
+full_data_scaled <- full_data_scaled %>%rowwise() %>%  mutate(stage_blooddraw_estimated = estimate_stage(sex, Histology_u19, MPS_stage, followup_lc))
+
+#change followup lc
+data_stageatblood <- full_data_scaled %>% filter(case_status_u19==1) %>% dplyr::select(participant_id,sex, followup_lc, Histology_u19, MPS_stage,stage_blooddraw_estimated) %>% filter(!is.na(MPS_stage)) %>% tidyr::pivot_longer(c("MPS_stage", "stage_blooddraw_estimated"), names_to="stage_type_time", values_to="stage_value") %>%
+  mutate(stage_value=ifelse(stage_value=="2B","2",stage_value),
+         stage_value=factor(stage_value, levels=c("preClinical", "1A","1B","2","3A","3B","4")),
+         time_before_diagnosis=ifelse(stage_type_time=="stage_blooddraw_estimated",followup_lc, 0),
+         color_prec_stage=ifelse(stage_type_time!="stage_blooddraw_estimated", paste0("blooddraw_",stage_value), NA)) %>% group_by(participant_id) %>% fill(color_prec_stage,.direction = "updown") %>% ungroup()
+
+data_stageatblood %>% write.csv(paste0(path_save_clean,"data_plot_stageatblooddraw.csv"), row.names = FALSE)
+
+
+plot_point_stageestimate_bloodraw <- data_stageatblood %>% add_count(stage_type_time,stage_value) %>% mutate(n=paste0("N=",n)) %>% 
+  ggplot(aes(x=time_before_diagnosis, y=stage_value, color=color_prec_stage))+
+  geom_count(aes(shape=stage_type_time))+
+  geom_text(data=. %>% filter(stage_type_time=="stage_blooddraw_estimated") %>% distinct(stage_value, .keep_all = T),aes(label=n, x=3.1), color="black" )+
+   geom_text(data=. %>% filter(stage_type_time!="stage_blooddraw_estimated") %>% distinct(stage_value, .keep_all = T),aes(label=n, x=-0.2), color="black" )+
+  geom_line(aes(group = participant_id))+
+  guides(shape=FALSE, size=FALSE)+
+  theme_bw()+#theme(legend.position = "none")+
+  scale_x_reverse()+
+  scale_shape_manual(values=c(17,16))+
+  ggsci::scale_color_nejm(name = "Stage at diagnosis", labels = c("1A", "1B", "2","3A","3B","4"))+
+  labs(y="Stage", x="Time from blood draw until diagnosis")
+
+
+#add number of stages at each prediag 
+#time before diagnosis 
+
+png(paste0(path_save_clean, "figures/plot_point_stageestimate_bloodraw.png"), height=1350, width=2300, res=280)
+plot_point_stageestimate_bloodraw
+dev.off()
+```
+# #####################################################################
+# #####################################################################
+# Survival analysis 
+case only analysis of dying bases on proteins, outcome : for cases : LC or non LC death 
+Regress cox models against protein and time to death 
+
+## create dataset for survival analysis
+```{r}
+library(dplyr)
+library(survival)
+library(broom)
+library(ggrepel) 
+case_survival <- full_data_scaled%>%filter(case_status_u19=="1")
+# "1 = Alive
+# 2 = Death from a lung cancer
+# 3 = Death from a cause other than lung cancer"
+
+#recalculate followup mortality from time of diagnosis as t0
+case_survival <- case_survival%>%mutate(followup_mortality=followup_mortality-followup_lc)
+#remove the ones with negative 
+case_survival%>%filter(followup_mortality<0) #2
+case_survival <- case_survival%>%filter(followup_mortality>=0)
+#recode mortality status as 0-1 : non LC death (alive+death other cause) vs LC death 
+
+#survival_overall: death not necessarily LC specific (we made it like this so we can compare with tcga mortality => we don't have info on cause of death)
+case_survival <- case_survival%>%mutate(mortality_LC=ifelse(status_mortality=="2",1,0) , survival_status=ifelse(status_mortality =="1",0,1)) ##HUNT coded as 4 => all cause we don't have any specificationos 
+
+
+full_data_scaled%>%filter(case_status_u19=="1") %>% mutate(f2=followup_mortality-followup_lc) %>% filter(f2<0| followup_lc<=0) %>% dplyr::select(status_mortality, f2, followup_mortality, followup_lc, cohort_id)
+
+
+case_survival %>% dplyr::select(survival_status) %>% gtsummary::tbl_summary() ## for survival negative followup time
+
+table_surv_nb <- full_data_scaled%>%filter(case_status_u19=="1")%>%mutate(`Status mortality`=ifelse(status_mortality =="1",0,1),followup_mortality=followup_mortality-followup_lc,
+                                                         `Status mortality`=case_when(`Status mortality`=="0"~"Alive at end of follow-up", `Status mortality`=="1"&followup_mortality<0~"Lung cancer diagnosis at death*", `Status mortality`=="1"&followup_mortality>=0~"Death"))%>% dplyr::select(`Status mortality`) %>% gtsummary::tbl_summary() %>% modify_footnote(update = everything() ~ NA) %>% modify_header(label = '**Among lung cancer cases**')
+
+with(case_survival, table(cohort_id, status_mortality))
+with(case_survival, table(cohort_id, survival_status))
+with(case_survival, table(status_mortality, survival_status))
+
+# rescale 
+case_survival <- case_survival %>% group_by(cohort_id) %>% mutate(across(replicated_50, ~scale(.))) %>% ungroup()
+```
+## checks on survival data 
+(is there an explanation that the follow up time for survival is shorter than the follow up time for diagnosis for the cohort MCCS?)
+```{r}
+with(filter(full_data_scaled, cohort_id=="MCCS"), by(followup_mortality, case_status_u19,summary))
+with(filter(full_data_scaled, cohort_id=="MCCS"), by(followup_lc, case_status_u19,summary))
+```
+# Sup Data 12
+```{r}
+##check if proteins have time varying effects -> interaction of proteins with time
+
+HR_main <- function(dat,prot_list,surv_status){  
+  HR_analysis <-data.frame(biom=NA,term=NA, estimate=NA, std.error=NA, statistic=NA, p.value=NA, nobs=NA) 
+  for (i in 1:length(prot_list)) {
+    model <- coxph(as.formula(sprintf("%s~%s",paste0("Surv(followup_mortality,",surv_status,")"),paste0(sapply(prot_list[i],as.name),"+",sapply(prot_list[i],as.name),":followup_lc+age+strata(cohort_id,sex)"))), data=dat)
+    n_obs=model %>% nobs()
+    interm_data <- model %>% broom::tidy(exponentiate = TRUE)%>%filter(grepl(prot_list[i],term))
+    interm_data <- interm_data%>%mutate(biom=prot_list[i],term=stringr::str_remove_all(term,"`"),nobs=n_obs)
+    HR_analysis <- bind_rows(HR_analysis, interm_data)
+    }
+  HR_analysis <- HR_analysis[-1,]
+  HR_analysis <- HR_analysis%>%mutate(set=case_when(biom %in% prot_allcohorts~"All cohorts", biom %in% protNSHDS_EPIC~"EPIC/NSHDS", T~"NA"),sig_HR=case_when(biom %in% prot_allcohorts & p.value<0.05~"sig", biom %in% protNSHDS_EPIC & p.value<0.05~"sig",T~"not sig"))
+  return(HR_analysis)
+  }
+
+with(case_survival, table(status_mortality, cohort_id, useNA="always"))
+# "1 = Alive
+# 2 = Death from a lung cancer
+# 3 = Death from a cause other than lung cancer"
+
+HR_prot_timevaryingeffect <- HR_main(case_survival,replicated_50,"survival_status")
+#mortality_LC vs survival_status
+
+write.csv(HR_prot_timevaryingeffect,paste0(path_save_clean,"tables/overall_survival_interaction.csv"))
+
+#ceacam5, vwa1,il2-ra,angpt2,tfpi-2,igfbp1,spint1,cfhr5 : HAVE TIME VARYING EFFECTS 
+#SOME ARE NOT SIGNIDICANT BEFORE WE ADDED THE INTERACTION TERM(ANGPT2,TFPI-2,CFHR5,SPINT1) -> WHAT DOES THAT MEAN 
+
+prot_HR_time_int <- HR_prot_timevaryingeffect %>% filter(grepl("followup",term), p.value<0.05) %>% dplyr::select(biom)# %>% dput()
+
+#all cause mortality 
+png(paste0(path_save_clean,"figures/HR_survival.png"),height=1400,width = 2200, res=250)
+HR_prot_timevaryingeffect %>% filter(!grepl("followup",term))%>%mutate(set=ifelse(set=="EPIC/NSHDS","EPIC and NSHDS","All cohorts"))%>%ggplot(aes(x=estimate, y=-log10(p.value), color=set))+geom_point()+scale_alpha_discrete(range=c(0.25,1),guide=FALSE)+geom_label_repel(data=.%>%filter(term %in% replicated_50, p.value<0.05), aes(label=term), max.overlaps = 600, show.legend = FALSE)+theme_bw()+geom_hline(yintercept = -log10(0.05),linetype="dashed",alpha=0.4)+labs(x="Hazard Ratios",y="-Log10(p-value)",title="Prelimenary results for the association of proteins \nwith Lung Cancer Survival", color="Dataset", caption="Only proteins that were selected during univariable analysis \nand with a nominally significant association to lung cancer survival are labelled \nsurvival models were adjusted on age and stratified by cohort and sex \n time before diagnostic as a time varying effect")+theme(plot.title=element_text(hjust=0.5, face="bold"), plot.caption=element_text(hjust=0))+scale_color_nejm()
+dev.off()
+# ##########
+
+HR_prot_timevaryingeffect %>% filter(!grepl("followup",term)) %>% filter(p.value<0.05)
+HR_prot_timevaryingeffect <- HR_prot_timevaryingeffect %>% dplyr::rename(pvalue_blood=p.value)
+
+## estimates from gene expression 
+surv_geneexpression_karl <- read.csv(paste0(path_general,"Data/Gene_Exp_Surv_Res_Overall.csv"))
+
+#filter to strata 
+surv_geneexpression_karl$Stratified.Variable %>% table(useNA = "always") #all vs site
+surv_geneexpression_karl$Strata %>% table(useNA = "always") #a;; 
+
+surv_geneexpression_karl <- surv_geneexpression_karl %>% mutate(z_score=Beta/SE)
+
+
+##create a data frame 3 columns : 1prot name, z score in blood, z score gene expression
+#make sure protein names are called the same 
+surv_geneexpression_karl$genes.gene[!surv_geneexpression_karl$genes.gene %in% HR_prot_timevaryingeffect$biom] %>% unique()
+
+HR_prot_timevaryingeffect$biom[!HR_prot_timevaryingeffect$biom %in% surv_geneexpression_karl$genes.gene] %>% unique()
+
+#1] "UPAR"  U-PAR   "CASP8"  CASP-8  "TFPI2" TFPI-2   "IGFBP2" IGFBP-2  "GDF15" GDF-15    "IL2RA" IL2-RA   "IGFBP1" IGFBP-2  "ENRAGE" EN-RAGE  "TGFalpha" TGF-alpha
+#[10] "MUC16"   MUC-16
+
+surv_geneexpression_karl <- surv_geneexpression_karl %>%
+  mutate(genes.gene=case_when(genes.gene=="UPAR"~"U-PAR",
+                               genes.gene=="CASP8"~"CASP-8",
+                               genes.gene=="TFPI2"~"TFPI-2",
+                               genes.gene=="IGFBP2"~"IGFBP-2",
+                               genes.gene=="GDF15"~"GDF-15",
+                               genes.gene=="IL2RA"~"IL2-RA",
+                               genes.gene=="IGFBP1"~"IGFBP-1",
+                               genes.gene=="ENRAGE"~"EN-RAGE",
+                               genes.gene=="TGFalpha"~"TGF-alpha",
+                               genes.gene=="MUC16"~"MUC-16",
+                               T~genes.gene))
+
+
+# 9)	Mortality z-score figure: Get underlying data from Karl. Change ‘risk protein association’ to ‘Legend.’ Don’t capitalize ‘blood’ or ‘tumor’ in legend. Bold lines at x=0 and y=0. Changes axis labels to say ‘Z-score based on tumor gene expression’ and ‘Z-score based on blood protein’. Re-export this figure so it looks nice like the others.
+```
+# Sup Data 14, Sup Figure 14
+```{r}
+library(ggsci)
+
+data_survival_estimates_blood_mrna <- HR_prot_timevaryingeffect %>% filter(!grepl("followup",term)) %>% dplyr::select(biom,statistic,pvalue_blood) %>% merge(surv_geneexpression_karl%>% filter(Stratified.Variable=="All") %>% dplyr::select(genes.gene, z_score, P_Value) , by.x="biom", by.y="genes.gene", all=TRUE) %>% mutate(legend= case_when(pvalue_blood<0.05 & P_Value<0.05~"*p* <0.05 in blood and tumor", pvalue_blood<0.05 &P_Value>=0.05~"*p* <0.05 only in blood", pvalue_blood>=0.05 & P_Value<0.05~"*p* <0.05 only in tumor",T~"*p* >0.05"))
+
+plt_Z_Z_HR <- data_survival_estimates_blood_mrna %>%
+  ggplot(aes(x=statistic,y=z_score,color=legend))+geom_point()+xlim(-2,4)+ylim(-2,4)+geom_abline(yintercept=0, slope=1, color="gray")+labs(y="Z-score based on tumor gene expression", x="Z-score based on blood protein", color="Legend")+theme_bw()+theme(axis.title = element_text(face="bold", size=13),legend.title = element_text(face="bold", size=13), axis.text = element_text(size=10), legend.text = element_markdown(size=10))+geom_hline(yintercept = 0)+geom_vline(xintercept = 0)+ ggrepel::geom_label_repel(data=. %>% filter(legend != "*p* >0.05"), aes(label=biom), show.legend = FALSE)+ggsci::scale_color_nejm()
+
+png(paste0(path_save_clean,"figures/Z_Z_survival_blood_gene.png"), height=1400,width = 2500, res=250)
+plt_Z_Z_HR
+dev.off()
+
+####
+table_surv_nb <- full_data_scaled%>%filter(case_status_u19=="1")%>%mutate(`Status mortality`=ifelse(status_mortality =="1",0,1),followup_mortality=followup_mortality-followup_lc,
+                                                         `Status mortality`=case_when(`Status mortality`=="0"~"Alive at end of follow-up", `Status mortality`=="1"&followup_mortality<0~"Lung cancer diagnosis at death*", `Status mortality`=="1"&followup_mortality>=0~"Death"))%>% dplyr::select(`Status mortality`) %>% gtsummary::tbl_summary() %>% modify_footnote(update = everything() ~ NA) %>% modify_header(label = '**Among lung cancer cases**')
+
+
+table_surv_nb_All <- full_data_scaled%>%filter(case_status_u19=="1")%>%mutate(`Status mortality`=ifelse(status_mortality =="1",0,1),followup_mortality=followup_mortality-followup_lc,
+                                                         `Status mortality`=case_when(`Status mortality`=="0"~"Alive at end of follow-up", `Status mortality`=="1"&followup_mortality<0~"Lung cancer diagnosis at death*", `Status mortality`=="1"&followup_mortality>=0&status_mortality=="2"~"Death from LC",`Status mortality`=="1"&followup_mortality>=0&status_mortality%in% c("3","4")~"Death from other causes"))%>% dplyr::select(`Status mortality`) %>% gtsummary::tbl_summary() %>% modify_footnote(update = everything() ~ NA) %>% modify_header(label = '**Among lung cancer cases**')
+
+table_surv_nb_All %>% 
+  as_flex_table() %>%
+  flextable::save_as_docx(path=paste0(path_save_clean,"figures/table_survival_n_All.docx"))
+
+## check significances of proteins after multiple comparisons
+data_survival_estimates_blood_mrna <- data_survival_estimates_blood_mrna %>% 
+  mutate(survival_sig_multipleComparisons=case_when(pvalue_blood<0.05/36 &P_Value>=0.05/36~"Bonferroni significant only in blood",
+                                                    pvalue_blood<0.05/36 &P_Value<0.05/36~"Bonferroni significant in blood and tumor",
+                                                    pvalue_blood>=0.05/36 &P_Value<0.05/36~"Bonferroni significant only in tumor", 
+                                                    T~"p>0.05/36"))
+
+data_survival_estimates_blood_mrna %>% filter(grepl("Bonferroni sig",survival_sig_multipleComparisons ))
+
+
+#CDCP1 in bloof and tumor 
+
+#CDP1, CEACAM5, VEGFA in blood only 
+```
+
+# #####################################################################
+# #####################################################################
+# Biological & Functional analysis for the identified proteins
+
+# Proteins and hallmarks 
+Attribute plots 
+https://cran.r-project.org/web/packages/UpSetR/vignettes/attribute.plots.html
+
+## Figure 3a
+```{r}
+library(UpSetR)
+list_prot_Hallmarks <- list(
+  `Angiogenesis (14)`=c("ANGPT2", "CASP-8","CEACAM5","CHI3L1" ,"CXCL13","CXL17", "GDF-15","HGF", "IL6", "MK", "MMP12","SYND1","TGF-alpha","VEGFA"),
+  `Escaping programmed cell death (9)`= c("ANGPT2", "CASP-8", "CEACAM5","CHI3L1","HGF", "MK", "TNFRSF6B", "TNFSF13B","U-PAR"),
+  `Proliferative signaling (17)`=c("CEACAM5", "EN-RAGE", "GDF-15", "HGF", "IFI30", "IGFBP-1", "IGFBP-2", "IL2-RA","IL6","MK", "OSM", "S100A11", "SCF", "SPINT1", "SYND1", "TGF-alpha", "VEGFA"),
+  `Evading supression of growth (1)`=c("TFPI-2"),
+  `Avoiding immune destruction (1)`=c("IFI30"),
+  `Tumor-promoting inflammation (14)`=c("ANGPT2", "CHI3L1", "CXCL13", "CXCL9", "CXL17", "EN-RAGE", "GDF-15", "IL2-RA", "IL6", "LAMP3", "MK", "OSM", "TNFSF13B", "VEGFA"),
+  `Activating invasion and metastasis (19)`=c("ANGPT2", "CDCP1", "CEACAM5","CHI3L1", "CXCL13","CXL17","HGF","GDF-15", "IGFBP-1", "IL6","MK","MMP12", "MUC-16","S100A11", "SCF", "SPINT1", "TFPI-2", "U-PAR", "VEGFA"),
+  `Deregulating cellular energetics (3)`=c("GDF-15", "IGFBP-1", "IGFBP-2"),
+  `Not assigned (5)`=c("ALPP", "CFHR5", "SFTPA1", "VWA1", "WFDC2"))
+
+## PLOTS 
+#try to remove the line connecting the dots 
+library(ComplexUpset)
+library(dplyr)
+prot_hallmarks_data <- data.frame(protein=replicated_50) %>% mutate(
+  `Angiogenesis (14)`=ifelse(protein %in% c("ANGPT2", "CASP-8","CEACAM5","CHI3L1" ,"CXCL13","CXL17", "GDF-15","HGF", "IL6", "MK", "MMP12","SYND1","TGF-alpha","VEGFA"),1,0),
+  `Escaping programmed cell death (9)`= ifelse(protein %in%  c("ANGPT2", "CASP-8", "CEACAM5","CHI3L1","HGF", "MK", "TNFRSF6B", "TNFSF13B","U-PAR"),1,0),
+  `Proliferative signaling (17)`=ifelse(protein %in% c("CEACAM5", "EN-RAGE", "GDF-15", "HGF", "IFI30", "IGFBP-1", "IGFBP-2", "IL2-RA","IL6","MK", "OSM", "S100A11", "SCF", "SPINT1", "SYND1", "TGF-alpha", "VEGFA"),1,0), 
+  `Evading supression of growth (1)`=ifelse(protein %in% c("TFPI-2"),1,0),
+  `Avoiding immune destruction (1)`=ifelse(protein %in% c("IFI30"),1,0),
+  `Tumor-promoting inflammation (14)`=ifelse(protein %in% c("ANGPT2", "CHI3L1", "CXCL13", "CXCL9", "CXL17", "EN-RAGE", "GDF-15", "IL2-RA", "IL6", "LAMP3", "MK", "OSM", "TNFSF13B", "VEGFA"),1,0), 
+  `Activating invasion and metastasis (19)`=ifelse(protein %in% c("ANGPT2", "CDCP1", "CEACAM5","CHI3L1", "CXCL13","CXL17","HGF","GDF-15", "IGFBP-1", "IL6","MK","MMP12", "MUC-16","S100A11", "SCF", "SPINT1", "TFPI-2", "U-PAR", "VEGFA"),1,0),
+  `Deregulating cellular energetics (3)`=ifelse(protein %in% c("GDF-15", "IGFBP-1", "IGFBP-2"),1,0),
+  `Not assigned (5)`=ifelse(protein %in% c("ALPP", "CFHR5", "SFTPA1", "VWA1", "WFDC2"),1,0), 
+  `Enabling replicative immortality (0)`=0, `Genome instability and mutation (0)`=0) %>% tibble::column_to_rownames(var="protein")
+#View(prot_hallmarks_data)
+
+
+hallmarks = colnames(prot_hallmarks_data)
+hallmarks %>% class
+hallmarks <- c("Activating invasion and metastasis (19)","Proliferative signaling (17)","Tumor-promoting inflammation (14)","Angiogenesis (14)","Escaping programmed cell death (9)","Deregulating cellular energetics (3)","Evading supression of growth (1)","Avoiding immune destruction (1)","Enabling replicative immortality (0)","Genome instability and mutation (0)","Not assigned (5)")
+
+prot_hallmarks_data[hallmarks] = prot_hallmarks_data[hallmarks] == 1
+
+
+hallmark_plot_order <- ComplexUpset::upset(
+    prot_hallmarks_data, rev(hallmarks), name='',n_intersections=80,sort_sets=FALSE,
+    sort_intersections_by=c('degree'),sort_intersections="ascending",
+    base_annotations=list(),#hide barplot of intersection size
+    set_sizes=FALSE,#hide set size
+    keep_empty_groups=TRUE,
+    stripes=c('white', 'grey90'), #
+    matrix=(
+        intersection_matrix(
+            segment=geom_segment(
+              #linetype="dotted",
+              alpha=0
+            )
+        )),
+     themes=upset_modify_themes(
+        list(
+            'intersections_matrix'=theme(text=element_text(face=c("bold","italic","italic","bold","bold","bold","bold","bold","bold","bold","bold")))
+    )),
+    queries=list(
+      upset_query(set =c("Not assigned (5)"),color=c('Black')),
+      upset_query(set=c("Tumor-promoting inflammation (14)"),color=c('#E18727FF')),
+      upset_query(set=c("Activating invasion and metastasis (19)"), color=c('#0072B5FF')),
+      upset_query(set=c("Proliferative signaling (17)"),color=c('#20854EFF')),
+      upset_query(set=c("Escaping programmed cell death (9)"),color=c('#7876B1FF')),
+      upset_query(set=c("Avoiding immune destruction (1)"),color=c('#6F99ADFF')),
+      upset_query(set=c("Angiogenesis (14)"),color=c('#BC3C29FF')),
+      upset_query(set=c("Deregulating cellular energetics (3)"),color=c('#FFDC91FF')),
+      upset_query(set=c("Evading supression of growth (1)"),color=c('#EE4C97FF'))
+))
+
+#"Activating invasion and metastasis (19)","Proliferative signaling (17)","Tumor-promoting inflammation (14)","Angiogenesis (14)","Escaping programmed cell death (9)","Deregulating cellular energetics (3)","Evading supression of growth (1)","Avoiding immune destruction (1)","Enabling replicative immortality (0)","Genome instability and mutation (0)","Not assigned (5)"
+
+png(paste0(path_save_clean,"figures/hallmarks.png"), height=1130, width=4300, res=400)
+hallmark_plot_order
+dev.off()
+
+
+pdf(paste0(path_save_clean,"figures/hallmarks.pdf"))
+hallmark_plot_order
+dev.off()
+
+data.frame(protein=replicated_50) %>% mutate(
+  `Angiogenesis (14)`=ifelse(protein %in% c("ANGPT2", "CASP-8","CEACAM5","CHI3L1" ,"CXCL13","CXL17", "GDF-15","HGF", "IL6", "MK", "MMP12","SYND1","TGF-alpha","VEGFA"),1,0),
+  `Escaping programmed cell death (9)`= ifelse(protein %in%  c("ANGPT2", "CASP-8", "CEACAM5","CHI3L1","HGF", "MK", "TNFRSF6B", "TNFSF13B","U-PAR"),1,0),
+  `Proliferative signaling (17)`=ifelse(protein %in% c("CEACAM5", "EN-RAGE", "GDF-15", "HGF", "IFI30", "IGFBP-1", "IGFBP-2", "IL2-RA","IL6","MK", "OSM", "S100A11", "SCF", "SPINT1", "SYND1", "TGF-alpha", "VEGFA"),1,0), 
+  `Evading supression of growth (1)`=ifelse(protein %in% c("TFPI-2"),1,0),
+  `Avoiding immune destruction (1)`=ifelse(protein %in% c("IFI30"),1,0),
+  `Tumor-promoting inflammation (14)`=ifelse(protein %in% c("ANGPT2", "CHI3L1", "CXCL13", "CXCL9", "CXL17", "EN-RAGE", "GDF-15", "IL2-RA", "IL6", "LAMP3", "MK", "OSM", "TNFSF13B", "VEGFA"),1,0), 
+  `Activating invasion and metastasis (19)`=ifelse(protein %in% c("ANGPT2", "CDCP1", "CEACAM5","CHI3L1", "CXCL13","CXL17","HGF","GDF-15", "IGFBP-1", "IL6","MK","MMP12", "MUC-16","S100A11", "SCF", "SPINT1", "TFPI-2", "U-PAR", "VEGFA"),1,0),
+  `Deregulating cellular energetics (3)`=ifelse(protein %in% c("GDF-15", "IGFBP-1", "IGFBP-2"),1,0),
+  `Not assigned (5)`=ifelse(protein %in% c("ALPP", "CFHR5", "SFTPA1", "VWA1", "WFDC2"),1,0), 
+  `Enabling replicative immortality (0)`=0, `Genome instability and mutation (0)`=0) %>% pivot_longer(!protein, names_to="hallmark", values_to = "present") %>% pivot_wider(names_from="protein", values_from="present") %>% write.csv(paste0(path_save_clean,"protein_perhallmark_final.csv"), row.names = F)
+```
+
+## Figure 3b (Lasso-Network analysis)
+```{r}
+#source("/data/LC3/work/HanaZahed/Protein Atlas Paper/penalisation_functions.R")
+```
+
+# Adjusted networks 
+Remove effects of age, sex and smoking status from protein concentrations using linear models -> get the residuals 
+we will not denoise fro cohort because proteins are scaled by cohrot
+we will run it on all the 36 protens -> only in EPIC and NSHDS 
+```{r}
+####### Controls #################
+## we want a complete case dataset for the proteins
+Control_Dat <- full_data_scaled_afterscript_arranged %>% dplyr::filter(case_status_u19==0) %>% dplyr::select(c("age","sex","smoke_status",all_of(replicated_50)))
+nrow(Control_Dat) #730
+
+# complete cases to get residuals 
+Control_Dat <- Control_Dat[complete.cases(Control_Dat),]  
+dim(Control_Dat) #249 , 39 [epic nshds only]
+
+Control_Dat %>% summarise(across(everything(),~sum(is.na(.))))
+
+#get dataset of residuals 
+set.seed(666)
+Control_Proteins_Resid <- data.frame(row=as.character(c(1:249)))
+
+ for(prot in replicated_50) {  temp_prot <- as.data.frame(resid(lm(as.formula(paste0("`",
+    prot,'` ~ ','age+sex+smoke_status')), Control_Dat)))
+  colnames(temp_prot) <- prot
+  Control_Proteins_Resid <- cbind(Control_Proteins_Resid, temp_prot)
+ }
+
+
+
+Control_Proteins_Resid <- Control_Proteins_Resid %>% dplyr::select(-row)
+dim(Control_Proteins_Resid) #449 36
+
+#make sure complete cases 
+Control_Proteins_Resid <- Control_Proteins_Resid[complete.cases(Control_Proteins_Resid),]
+dim(Control_Proteins_Resid)#249 36
+```
+
+```{r}
+#### Run network analysis ########
+# Network estimation: calibration and estimation of the stability selection model 
+out=CalibrateNetwork(data=Control_Proteins_Resid, PFER_thr=25) # PFER_thr is the threshold on expected number of False Positives (optional but makes networks sparser and computations faster)
+
+# Calibrated Parameters (penalty lambda and threshold in selection proportion pi)
+print(GetArgmax(out))
+
+# Calibrated Adjacency matrix (binary: 1 if there is an edge)
+A0_Hana=CalibratedAdjacency(out)
+
+# Calibration heatmap (2-d representation)
+CalibrationPlot(out, bi_dim=TRUE)#, filename=paste0(filepath, "Calibration_plot_2d_Controls_Resid.pdf"), lwd=0.5, width=14, height=7)
+
+# Calibration plot (1-d representation)
+CalibrationPlot(out, bi_dim=FALSE)#, filename=paste0(filepath, "Calibration_plot_1d_Controls_Resid.pdf"), lwd=0.5, width=14, height=7)
+
+# Estimated graph
+g0=GetGraph(adjacency=A0_Hana)
+
+#png(paste0(path_save_clean, "network_control.png"), width=2500,height=1700,res=250)
+plot(g0, layout=layout_with_fr(g0),vertex.size = 10, vertex.frame.color = NA, vertex.label.cex = .7)
+#dev.off()
+############ ############ ############ ############ ############ ############ ############ 
+```
+
+```{r}
+############ Cases ##################
+
+Cases_Dat <- full_data_scaled_afterscript_arranged %>% filter(case_status_u19==1) %>% dplyr::select(c("age","sex","smoke_status",all_of(replicated_50)))
+nrow(Cases_Dat) #730
+
+Cases_Dat <- Cases_Dat[complete.cases(Cases_Dat),]  
+dim(Cases_Dat) #251 , 39
+Cases_Dat %>% summarise(across(everything(),~sum(is.na(.))))
+
+
+set.seed(666)
+Cases_Proteins_Resid <- data.frame(row=as.character(c(1:251)))
+for(prot in replicated_50) { 
+  temp_prot <- as.data.frame(resid(lm(as.formula(paste0("`",
+    prot,'` ~ ','age+sex+smoke_status')), Cases_Dat)))
+  colnames(temp_prot) <- prot
+  Cases_Proteins_Resid <- cbind(Cases_Proteins_Resid, temp_prot)
+ }
+
+
+#Cases_Proteins_Resid %>% arrange(as.numeric(row)) %>% View
+
+Cases_Proteins_Resid <- Cases_Proteins_Resid %>% dplyr::select(-row)
+Cases_Proteins_Resid <- Cases_Proteins_Resid[complete.cases(Cases_Proteins_Resid),]
+dim(Cases_Proteins_Resid)#251 36 ok
+```
+
+```{r}
+## Run network analysis 
+# Network estimation: calibration and estimation of the stability selection model 
+
+out=CalibrateNetwork(data=Cases_Proteins_Resid, PFER_thr=25) # PFER_thr is the threshold on expected number of False Positives (optional but makes networks sparser and computations faster)
+
+
+# Calibrated Parameters (penalty lambda and threshold in selection proportion pi)
+print(GetArgmax(out))
+
+# Calibrated Adjacency matrix (binary: 1 if there is an edge)
+A1_Hana=CalibratedAdjacency(out)
+class(A1_Hana) #matric, arrat
+
+# Calibration heatmap (2-d representation)
+CalibrationPlot(out, bi_dim=TRUE)#, filename=paste0(filepath, "Calibration_plot_2d_Cases_Resid.pdf"), lwd=0.5, width=14, height=7)
+
+# Calibration plot (1-d representation)
+CalibrationPlot(out, bi_dim=FALSE)#, filename=paste0(filepath, "Calibration_plot_1d_Cases_Resid.pdf"), lwd=0.5, width=14, height=7)
+
+# Estimated graph
+g1=GetGraph(adjacency=A1_Hana, node_color=rep("tomato",ncol(A1_Hana)))
+set.seed(1)
+#png("/data/LC3/work/HanaZahed/Protein Atlas Paper/Network/network_cases.png", width=2500,height=1700,res=250)
+plot(g1, layout=layout_with_fr(g1),vertex.size = 10, vertex.frame.color = NA, vertex.label.cex = .7)
+#dev.off()
+```
+
+# get specific edges 
+```{r}
+## Graph comparison
+# Identifying common and condition-specific edges
+Asum_Hana=A0_Hana+2*A1_Hana
+table(Asum_Hana) # 1 for condition 0 only, 2 for condition 1 only, 3 for common to both conditions
+
+# Adjacency matrix of common edges
+Aboth=ifelse(Asum_Hana==3, yes=1, no=0)
+gboth=GetGraph(adjacency=Aboth) 
+set.seed(123)
+
+kk <- layout_with_kk(gboth)
+
+png(paste0(path_save_clean,"figures/network_commonedges_36prot.png"), width = 1200,height = 1600, res=250)
+plot(gboth,  layout=kk,vertex.size = 10, vertex.frame.color = NA, vertex.label.cex = .7,main="Common edges",vertex.color="tomato") #like this ++
+dev.off()
+
+# Adjacency matrix of condition 0-specific edges
+A0only=ifelse(Asum_Hana==1, yes=1, no=0)
+
+g0only=GetGraph(adjacency=A0only) 
+
+nice <- layout_nicely(g0only)
+
+png(paste0(path_save_clean,"figures/network_control_onlyedges_36prot.png"), width = 1200,height = 1600, res=250)
+plot(g0only,  layout=nice,vertex.size = 10, vertex.frame.color = NA, vertex.label.cex = .7, main="Controls specific edges" ) #like this 
+dev.off()
+
+
+# Adjacency matrix of condition 1-specific edges
+A1only_Hana=ifelse(Asum_Hana==2, yes=1, no=0)
+
+set.seed(123)
+g1only_Hana=GetGraph(adjacency=A1only_Hana)
+
+graphopt <- layout_with_graphopt(g1only_Hana)
+
+png(paste0(path_save_clean,"figures/network_cases_onlyedges_36prot.png"), width = 1200,height = 1600, res=250)
+plot(g1only_Hana,  layout=graphopt,vertex.size = 10, vertex.frame.color = NA, vertex.label.cex = .7, main="Case specific edges ")
+dev.off()
+```
+# Figure 3b 
+```{r}
+#library(GGally)
+library(network)
+library(sna)
+library(scales)
+library(intergraph)
+
+#case only networks 
+case_only_network <- GGally::ggnet2(g1only_Hana, label=TRUE, label.size = 1.5, color="grey", edge.size = 0.8,mode = "fruchtermanreingold")
+
+png(paste0(path_save_clean,"figures/network_cases_onlyedges_36prot_ggnet.png"), width = 1200,height = 1600, res=250)
+case_only_network
+dev.off()
+
+
+## control only network
+control_only_network <- GGally::ggnet2(g0only, label=TRUE, label.size = 1.5, color="grey", edge.size = 0.8,mode = "fruchtermanreingold")
+
+png(paste0(path_save_clean,"figures/network_controls_onlyedges_36prot_ggnet.png"), width = 1200,height = 1600, res=250)
+control_only_network
+dev.off()
+
+## both 
+common_edges_network <- GGally::ggnet2(gboth, label=TRUE, label.size = 1.5, color="grey", edge.size = 0.8,mode = "fruchtermanreingold")
+
+png(paste0(path_save_clean,"figures/network_commonedges_36prot_ggnet.png"), width = 1200,height = 1600, res=250)
+common_edges_network
+dev.off()
+```
+### Network Centralities metics 
+### Sup data 11
+```{r}
+centralities_graph_function <-function(x){
+  centralities <- data.frame(protein=replicated_50)
+  
+  degree <- igraph::degree(x) %>% as.data.frame() %>% 
+  tibble::rownames_to_column("protein") %>% rename_with(~ c("degree")[which(c(".") == .x)], .cols = c(".")) 
+
+  betweeness<- igraph::betweenness(x)%>% as.data.frame() %>% 
+  tibble::rownames_to_column("protein") %>% rename_with(~ c("betweeness")[which(c(".") == .x)], .cols = c(".")) 
+  
+  closeness <- igraph::closeness(x)%>% as.data.frame() %>% 
+  tibble::rownames_to_column("protein") %>% rename_with(~ c("closeness")[which(c(".") == .x)], .cols = c("."))  #disconnected 
+
+  eigen_centrality <- igraph::eigen_centrality(x)%>% as.data.frame() %>% 
+  tibble::rownames_to_column("protein") %>% dplyr::rename(eigen_vector=vector) %>% dplyr::select(protein, eigen_vector)
+
+  centralities <- centralities %>% merge(degree, by="protein", all.x=TRUE, all.y=TRUE) %>% merge(betweeness, by="protein", all.x=TRUE, all.y=TRUE) %>% merge(closeness, by="protein",all.x=TRUE, all.y=TRUE) %>% merge(eigen_centrality, by="protein", all.x=TRUE, all.y=TRUE)
+  
+  return(centralities)
+}
+
+
+oldnames <- c("degree", "betweeness","closeness","eigen_vector")
+newnames_cases <- paste0(oldnames,"_cases")
+newnames_ctrl <- paste0(oldnames,"_ctrl")
+
+
+centralities_g0 <- centralities_graph_function(g0) %>%rename_with(~ newnames_ctrl[which(oldnames == .x)], .cols = oldnames)
+
+centralities_g1 <- centralities_graph_function(g1) %>% rename_with(~ newnames_cases[which(oldnames == .x)], .cols = oldnames)
+
+
+centralities_both <- bind_rows(cases=centralities_g1, controls=centralities_g0, .id="set")
+
+centralities_both2 <- merge(centralities_g0, centralities_g1, all=TRUE, by="protein")
+
+centralities_both2 <- centralities_both2 %>% relocate(protein, degree_ctrl, degree_cases, betweeness_ctrl,betweeness_cases, closeness_ctrl, closeness_cases, eigen_vector_ctrl, eigen_vector_cases) %>% mutate(across(where(is.numeric),~round(.,digits=2)),across(contains("degree"), ~ifelse(is.na(.),0,.)), across(everything() & !c("protein", contains("degree")),~ifelse(is.na(.),"",.)))
+
+
+write.csv(centralities_g0, paste0(path_save_clean,"tables/centralities_controls.csv"), row.names = FALSE)
+write.csv(centralities_g1, paste0(path_save_clean,"tables/centralities_cases.csv"), row.names = FALSE)
+write.csv(centralities_both2, paste0(path_save_clean,"tables/centralities_all2.csv"), row.names = FALSE)
+```
+
+# raw-protein correlation
+(residualized)
+# Sup Figure 13
+```{r}
+# In controls only
+Control_Proteins_Resid %>% dim
+
+library(corrplot)
+library(ggcorrplot)
+cormat_ctrl_r <- cor(as.matrix(Control_Proteins_Resid))
+cormat_ctr_p <- cor_pmat(as.matrix(Control_Proteins_Resid))
+
+
+png("/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/figures/controls_protcorr_resid.png",width = 2000,height=2000,res=250)
+corrplot(cormat_ctrl_r, method = "color",type="upper", order="alphabet", 
+         p.mat = cormat_ctr_p, sig.level = 0.05, insig = "blank", tl.col="black", tl.cex=0.8, tl.srt = 45,title="protein correlation among controls", mar=c(0,0,1,0))
+dev.off()
+
+corrplot(cormat_ctrl_r, method = "color",type="upper", order="hclust", 
+         p.mat = cormat_ctr_p, sig.level = 0.05, insig = "blank", tl.col="black", tl.cex=0.8, tl.srt = 45,title="protein correlation among controls", mar=c(0,0,1,0))
+
+
+### In cases
+Cases_Proteins_Resid %>% dim
+
+#cormat_cases <- Hmisc::rcorr(as.matrix(Cases_Proteins_Resid), type="pearson")
+cormat_cases_r <- cor(as.matrix(Cases_Proteins_Resid))
+cormat_cases_p <- cor_pmat(as.matrix(Cases_Proteins_Resid))
+
+
+
+png("/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/figures/cases_protcorr_resid.png",width = 2000,height=2000,res=250)
+corrplot(cormat_cases_r, method = "color",type="lower", order="alphabet", 
+         p.mat = cormat_cases_p, sig.level = 0.05, insig = "blank", tl.col="black", tl.cex=0.8, tl.srt = 45,title="protein correlation among cases", mar=c(0,0,1,0))
+dev.off()
+```
+
+
+# tissue specififc gene(mRNA) expression
+## Figure 4
+create heatmap using Vicky's data (she had previously downloaded the mrna tissue expression and calculated tissue specificty )
+```{r}
+library(readxl)
+tissu_mrna_expression <- read_excel(paste0(path_general, "/Data/Quantitative Cell Type Expression.xlsx"), skip=1)
+tissu_mrna_expression <- tissu_mrna_expression %>% select_if(all_not_na)
+
+#change to protein names to protein names because here we have genes 
+full_oids <- read.csv("/data/LC3/files/01-Databases/Targeted discovery master data/Annotations_Olink.csv")
+full_oids <- full_oids%>% distinct(Assay,.keep_all = TRUE)
+oids_replicated <- full_oids %>% dplyr::filter(Assay %in% replicated_50) %>% dplyr::select(Uniprot.ID, Assay)
+
+#get gene names 
+gene_uniprot <- read_excel(paste0(path_general, "/Data/Protein info All Human Olink Panels_20190918.xlsx"))
+gene_uniprot <- gene_uniprot %>% dplyr::select(`Uniprot id`,`Gene name`)
+
+#merge dataset to get complete dataset with both info 
+oids_replicated <- oids_replicated %>% merge(gene_uniprot, by.x = "Uniprot.ID", by.y="Uniprot id", all.x = TRUE, all.y = FALSE)
+
+# restructure the data set 
+
+tissu_mrna_expression_long <- tissu_mrna_expression %>%dplyr::rename(Gene=Protein) %>%  merge(dplyr::select(oids_replicated, Assay, `Gene name`),by.x="Gene",by.y="Gene name") %>% dplyr::select(-Gene) %>%  tidyr::pivot_longer(!Assay, names_to = "expression_in", values_to="expression_value") %>% 
+  dplyr::mutate(tissu=case_when(
+    expression_in %in% c("Alveolar type 1 cells",	"Alveolar  type 2 cells",	"Ciliated cells","Club cells")~"Lung Cells",
+    expression_in %in% c("B-cells",	"Granulocytes",	"Macrophages",	"Monocytes",	"T-cells",	"Kupffer cells",	"Erythroid cells")~"Blood/Immune Cells",
+    expression_in %in% c("Hepatocytes",	"Other epithelial cells")~"Non lung epithelial cells",
+    TRUE~as.character(expression_in))) 
+
+
+## Make plot  
+order_gene <- tissu_mrna_expression$Protein
+order_prot <- tissu_mrna_expression %>%dplyr::rename(Gene=Protein) %>%  merge(dplyr::select(oids_replicated, Assay, `Gene name`),by.x="Gene",by.y="Gene name") %>% dplyr::select(Gene, Assay) %>% mutate(Gene=factor(Gene, level=order_gene)) %>% arrange(Gene)
+order_prot$Assay
+
+tissu_controls_expr_plot <- tissu_mrna_expression_long%>%
+  mutate(tissu=factor(tissu, level=c("Lung Cells","Blood/Immune Cells","Non lung epithelial cells","Endothelial cells"	,"Total Endocrine cells",	"Pigment cells",		"Total Mesenchymal cells",	"Total Muscle cells")), 
+         Assay=factor(Assay,order_prot$Assay)) %>%
+  ggplot(aes(x=factor(expression_in, level=c("Alveolar type 1 cells",	"Alveolar  type 2 cells",	"Ciliated cells",	"Club cells",	"B-cells","Granulocytes",	"Macrophages",	"Monocytes",	"T-cells",	"Kupffer cells",	"Erythroid cells","Hepatocytes",	"Other epithelial cells",	"Endothelial cells"	,"Total Endocrine cells",	"Pigment cells",		"Total Mesenchymal cells",	"Total Muscle cells")), y=Assay, fill=tissu, alpha=expression_value))+
+  geom_raster()+theme_bw()+labs(alpha="Expression value (%)", fill="Tissue",x="Cell type",y="Protein")+
+  theme(axis.text.x = element_text(angle=45,vjust=1,hjust=1),panel.grid.major = element_blank(), axis.title = element_text(face = "bold"), legend.title = element_text(face="bold"),legend.position = "bottom", legend.box = "vertical")+ 
+  scale_alpha_continuous(range = c(0, 1),breaks = c(0, 25, 50,75), labels = c("0-25%", "25-50%", "50-75",">75%"))+scale_fill_manual(values =  c("Lung Cells" = "#0072B5FF", "Blood/Immune Cells" = "#BC3C29FF", "Non lung epithelial cells" = "#E18727FF", "Endothelial cells" ="#20854EFF", "Total Endocrine cells"="#7876B1FF",	"Pigment cells"="#6F99ADFF",		"Total Mesenchymal cells"="#FFDC91FF",	"Total Muscle cells"="#EE4C97FF"))+scale_y_discrete(limits=rev)
+
+
+
+#png(paste0(path_save_clean,"/figures/tissue_Specific_expression2.png"), height=2000,width=2500,res=280)
+#tissu_controls_expr_plot+theme(legend.position = "right")
+#dev.off()
+
+
+####### 
+#luad , lusc, blca,cesc
+#tumor expression plot 
+tumor_mrna_expression <- read.csv("/data/LC3/work/smithk/Mean_Tumor_Expression_X_Cancer.csv")
+#checks 
+tumor_mrna_expression$Gene[!tumor_mrna_expression$Gene %in% oids_replicated$`Gene name`] %>% unique() #"UPAR"/PLAUR     "SCF"/KITLG      "MK" /"MDK"      "SYND1"/SDC1    "ENRAGE"/S100A12   "TGFalpha"/TGFA "CXL17"/CXCL17 
+#change gene names for correct merge 
+tumor_mrna_expression <- tumor_mrna_expression %>%
+  mutate(Gene=case_when(Gene=="UPAR"~"PLAUR",
+                        Gene=="SCF"~"KITLG",
+                        Gene=="MK"~"MDK",
+                        Gene=="SYND1"~"SDC1",
+                        Gene=="ENRAGE"~"S100A12",
+                        Gene=="TGFalpha"~"TGFA",
+                        Gene=="CXL17"~"CXCL17",
+                        T~as.character(Gene)))
+
+cancer_names <- read_excel("/data/LC3/work/HanaZahed/TCGA_cancerSites_Abbr.xlsx")
+
+tumor_mrna_expression <- tumor_mrna_expression %>% merge(cancer_names, by.x="expression_in", by.y="Abbr", all.x = TRUE, all.y=FALSE) %>% dplyr::rename(expression_in_abbr=expression_in, expression_in=Name)
+
+
+order_cancer <- tumor_mrna_expression %>% mutate(cancer=factor(cancer, levels=c("Lung Cancer","Other Smoking Related Cancer","Other Cancer"))) %>% arrange(cancer)
+
+order_cancer<- order_cancer$expression_in %>% unique()
+
+tumor_exp_plot <- tumor_mrna_expression %>% dplyr::select(-X) %>%  merge(dplyr::select(oids_replicated, Assay, `Gene name`),by.x="Gene",by.y="Gene name") %>% dplyr::select(-Gene) %>% mutate(Assay=factor(Assay,order_prot$Assay), cancer=factor(cancer,levels=c("Lung Cancer","Other Smoking Related Cancer","Other Cancer"))) %>% 
+  ggplot(aes(x=factor(expression_in, level=order_cancer), y=Assay, fill=cancer, alpha=expression_value))+
+  geom_raster()+theme_bw()+labs(alpha="Expression value (%)", fill="Cancer type",x="Cancer site",y="Protein")+
+  theme(axis.text.x = element_text(angle=45,vjust=1,hjust=1),panel.grid.major = element_blank(), axis.title = element_text(face = "bold"), legend.title = element_text(face="bold"), legend.position = "bottom", legend.box = "vertical")+ 
+  scale_alpha_continuous(range = c(0, 1),breaks = c(0, 0.25,0.5,0.75), labels = c("0-25%", "25-50%", "50-75",">75%"))+scale_fill_manual(values =  c("Lung Cancer" = "#0072B5FF", "Other Smoking Related Cancer" = "#BC3C29FF", "Other Cancer" = "#E18727FF"))+scale_y_discrete(limits=rev) 
+
+## put them together 
+library(gridExtra)
+library(ggpubr)
+
+
+png(paste0(path_save_clean,"/figures/tissue_Specific_expression_controls_cases.png"), height=2800,width=4000,res=330)
+cowplot::plot_grid(
+  cowplot::plot_grid(
+    tissu_controls_expr_plot+guides(alpha=FALSE,fill=guide_legend(ncol=2,title.position = "top"))+labs(title="a")+ theme(plot.title=element_text(face="bold")) ,
+    tumor_exp_plot+guides(alpha=FALSE,fill=guide_legend(ncol=1,title.position = "top"))+labs(y="",title="b")+ theme(plot.title=element_text(face="bold")) ,
+    ncol = 2, align = "h",labels = c(), vjust=1),
+   cowplot::get_legend(tissu_controls_expr_plot + scale_fill_discrete(guide = FALSE) + 
+      theme(legend.position = "bottom")),
+   ncol=1, rel_heights=c(0.95, .05))
+dev.off()
+
+
+
+pdf(paste0(path_save_clean,"/figures/fig4_tissue_Specific_expression_controls_cases.pdf"), height=9, width=12)
+cowplot::plot_grid(
+  cowplot::plot_grid(
+    tissu_controls_expr_plot+guides(alpha=FALSE,fill=guide_legend(ncol=2,title.position = "top"))+labs(title="a")+ theme(plot.title=element_text(face="bold")) ,
+    tumor_exp_plot+guides(alpha=FALSE,fill=guide_legend(ncol=1,title.position = "top"))+labs(y="",title="b")+ theme(plot.title=element_text(face="bold")) ,
+    ncol = 2, align = "h",labels = c(), vjust=1),
+   cowplot::get_legend(tissu_controls_expr_plot + scale_fill_discrete(guide = FALSE) + 
+      theme(legend.position = "bottom")),
+   ncol=1, rel_heights=c(0.95, .05))
+dev.off()
+```
+
+# Pathway analysis 
+# Sup Fig 12
+## overall pathway 
+```{r}
+library(gprofiler2)
+#g:GOSt - functional enrichment analysis of gene list
+#non ordered list
+nordered_gost <- gost(query=c("CFHR5" ,"SPINT1", "ALPP","ANGPT2","CASP8","CDCP1","CEACAM5",
+                              "CHI3L1","CXCL13","CXCL9","CXCL17","S100A12","GDF15","HGF","IFI30",
+                              "IGFBP1","IGFBP2","IL2RA","IL6","LAMP3","MDK","MMP12","MUC16","OSM",
+                              "S100A11","KITLG","SFTPA1","SDC1","TFPI2", "TGFA","TNFRSF6B","TNFSF13B",
+                              "PLAUR","VEGFA","VWA1","WFDC2"))
+
+#ordered lsit
+ordered_gost <- gost(query=c("CEACAM5","CXCL17","MMP12","WFDC2","SPINT1","GDF15","ALPP", 
+                             "CFHR5" ,"CXCL9","IL6","CDCP1","LAMP3","SDC1","CXCL13","MDK",
+                             "IFI30","PLAUR","CHI3L1","MUC16","VWA1","S100A11","SFTPA1",
+                             "TFPI2","CASP8","TGFA","HGF","OSM","TNFRSF6B","TNFSF13B",
+                             "S100A12","IGFBP2","IL2RA","VEGFA","ANGPT2",
+                             "IGFBP1","KITLG"), ordered_query = TRUE)
+
+
+
+library(gprofiler2)
+data_nonordered <- arrange(nordered_gost$result, desc(intersection_size))
+nonordered_pathway_plot <- publish_gosttable(data_nonordered,
+                             highlight_terms=filter(data_nonordered, intersection_size>15),
+                             use_colors = TRUE, 
+                             show_columns = c("source", "term_name", "term_size", "intersection_size"),
+                             #limitsize = TRUE,
+                             filename = "/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/gprofiler_nonordered.png",
+                             ggplot=TRUE)
+
+## ordered query 
+data_arranged <- arrange(ordered_gost$result, desc(intersection_size))
+
+ttordered_plot <- publish_gosttable(data_arranged,highlight_terms=filter(data_arranged, intersection_size>15),
+                             use_colors = TRUE, 
+                             show_columns = c("source", "term_name", "term_size", "intersection_size"),
+                             #limitsize = TRUE,
+                             filename = "/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/testgprofiler_ordered.png",
+                             ggplot=TRUE)
+
+
+
+
+publish_gostplot(gostplot(ordered_gost, capped = FALSE, interactive = FALSE),
+                 highlight_terms=filter(ordered_gost$result, intersection_size>15),
+                 filename = "/data/LC3/work/HanaZahed/Protein Atlas Paper/Final tables and figures/testgprofiler_orderedPLOT.png")
+
+
+#response to stimulus :http://amigo.geneontology.org/amigo/term/GO:0050896
+
+```
+
